@@ -61,6 +61,33 @@ pub struct ProgressError {
     pub reason: String,
 }
 
+pub fn contract() -> &'static serde_json::Value {
+    static CONTRACT: std::sync::LazyLock<serde_json::Value> = std::sync::LazyLock::new(|| serde_json::from_str(r#"{"version":"1","methods":{"aggregate":{"mode":"unary","input":{"type":"object","additionalProperties":false,"required":["logs"],"properties":{"logs":{"type":"array","maxItems":1000,"items":{"type":"object","additionalProperties":false,"required":["level","message","duration_ms"],"properties":{"level":{"type":"string","minLength":1,"maxLength":16},"message":{"type":"string","maxLength":128},"duration_ms":{"type":"integer","minimum":0,"maximum":60000}}}}}},"output":{"type":"object","additionalProperties":false,"required":["count","error_count","total_duration_ms"],"properties":{"count":{"type":"integer","minimum":0,"maximum":1000},"error_count":{"type":"integer","minimum":0,"maximum":1000},"total_duration_ms":{"type":"integer","minimum":0,"maximum":60000000}}},"error":{"type":"object","additionalProperties":false,"required":["reason"],"properties":{"reason":{"type":"string","maxLength":128}}}},"progress":{"mode":"stream","input":{"type":"object","additionalProperties":false,"required":["logs"],"properties":{"logs":{"type":"array","maxItems":1000,"items":{"type":"object","additionalProperties":false,"required":["level","message","duration_ms"],"properties":{"level":{"type":"string","minLength":1,"maxLength":16},"message":{"type":"string","maxLength":128},"duration_ms":{"type":"integer","minimum":0,"maximum":60000}}}},"delay_ms":{"type":"integer","minimum":0,"maximum":1000}}},"output":{"type":"object","additionalProperties":false,"required":["processed","total"],"properties":{"processed":{"type":"integer","minimum":0,"maximum":1000},"total":{"type":"integer","minimum":0,"maximum":1000}}},"error":{"type":"object","additionalProperties":false,"required":["reason"],"properties":{"reason":{"type":"string","maxLength":128}}}}}}"#).expect("generated contract"));
+    &CONTRACT
+}
+
+#[derive(Default)]
+pub struct LogsServer { handlers: runtime_sdk::Handlers }
+impl LogsServer {
+    pub fn new() -> Self { <Self as Default>::default() }
+    pub fn aggregate<F, Fut>(mut self, handler: F) -> Self
+    where F: Fn(AggregateInput, runtime_sdk::HandlerContext) -> Fut + Send + Sync + 'static,
+          Fut: std::future::Future<Output = Result<AggregateOutput, runtime_sdk::BusinessError<AggregateError>>> + Send + 'static {
+        self.handlers.unary("aggregate", handler);
+        self
+    }
+    pub fn progress<F, Fut>(mut self, handler: F) -> Self
+    where F: Fn(ProgressInput, runtime_sdk::HandlerContext, runtime_sdk::StreamSender<ProgressOutput>) -> Fut + Send + Sync + 'static,
+          Fut: std::future::Future<Output = Result<(), runtime_sdk::RuntimeError>> + Send + 'static {
+        self.handlers.stream("progress", handler);
+        self
+    }
+    pub fn build(self) -> Result<runtime_sdk::Handlers, runtime_sdk::RuntimeError> {
+        self.handlers.validate(contract())?;
+        Ok(self.handlers)
+    }
+}
+
 pub struct LogsClient {
     host: runtime_sdk::RuntimeHost,
     target: runtime_sdk::Target,
@@ -70,9 +97,9 @@ impl LogsClient {
         Self { host, target: runtime_sdk::Target { namespace: namespace.into(), service: service.into(), contract_version: "1".into() } }
     }
     pub async fn aggregate(&self, input: AggregateInput, options: runtime_sdk::CallOptions) -> Result<AggregateOutput, runtime_sdk::RuntimeError> {
-        self.host.call(&self.target, "aggregate", input, options).await
+        self.host.call_contract(&self.target, "aggregate", input, options, &contract()["methods"]["aggregate"]).await
     }
     pub fn progress(&self, input: ProgressInput, options: runtime_sdk::CallOptions) -> Result<runtime_sdk::ResponseStream<ProgressOutput>, runtime_sdk::RuntimeError> {
-        self.host.stream(&self.target, "progress", input, options)
+        self.host.stream_contract(&self.target, "progress", input, options, &contract()["methods"]["progress"])
     }
 }

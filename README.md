@@ -57,30 +57,72 @@ nullable fields are deliberately rejected in v1, at registration and generation.
 Integers use canonical JSON integer tokens in the safe range; optional values
 must be omitted rather than passed as JavaScript `undefined`.
 
-Both generated clients obtain their version from the contract source. TypeScript
-also checks the caller's output/error contract before exposing typed results.
+Both generated clients obtain their version and validation schemas from the
+contract source. TS and Rust check the caller's input, output, business error
+and stream-item constraints, not only language types or the callee's contract.
+Rust's generated `LogsServer` builder infers handler input/output types and
+checks complete bindings before connect:
+
+```rust
+let handlers = LogsServer::new()
+    .aggregate(aggregate)
+    .progress(progress)
+    .build()?;
+let host = RuntimeHost::connect(options, handlers).await?;
+// Stop admission and await bounded work before releasing native resources.
+host.drain(5000).await?;
+host.close();
+```
+
+See `examples/batch/src/main.rs` for the async handlers and host options.
+Manual `Handlers::unary` / `Handlers::stream` remain available and use the same
+exact method/mode/duplicate validation. Failed initialization never sends ready
+or leaves background connection tasks running.
+Rust's low-level generic `call` / `stream` only deserialize; use the generated
+client or `call_contract` / `stream_contract` for caller-side schema validation.
 For nested calls, explicitly forward trace and cancellation context:
 `{traceId: context.traceId, parentId: context.callId, signal: context.signal}`.
 Rust exposes the equivalent `trace_id`, `call_id` and cancellation token.
 The SDK does not install an implicit global business container.
 
-The companion integration changes in the local `lenso` checkout contain
-`packages/runtime` and `examples/runtime` for core Plugin/Manage/Engine integration.
-Those changes and the Console adapter are not included in this repository and
-have not been published upstream with this source release. The standalone build,
-tests, smoke example and performance entry above need only this repository.
-The runtime SDK is an ordinary
-package, `@lenso/runtime-sdk`; checkout-local package resolution is only a
-development integration aid, not an npm release.
+The companion `lenso` repository already contains `packages/runtime` and
+`examples/runtime` for Core Plugin/Manage/Engine integration. The `lenso-console`
+repository contains `packages/console-runtime`, the optional read-only page.
+These remain separately owned repositories, not source copied into this one.
+The standalone build, tests, smoke example and performance entry above need
+only this repository. `@lenso/runtime-sdk` is an ordinary package, but the
+checkout-local SDK and adapter version strings do not imply npm publication.
 Use `startRuntimeApp` for a serving App: it binds native exports after Core setup,
 then publishes readiness, and pre-drains before Core cleanup. Plain `startApp`
 can create an outbound-only caller without publishing server capabilities.
 The Console checkout supplies the independent optional `@lenso/console-runtime`
 page. Its example host selects it only with `LENSO_RUNTIME_PORT`, using the
 existing authenticated administrator session and generic plugin route.
-After preparing that checkout's public packages and generated example client:
-`LENSO_ROOT=/absolute/path/to/lenso bun run verify:lenso` exercises actual CLI
-inspect/call, source-watch invalidation, independent Rust restart and cleanup.
+For source integration, use Bun 1.4.3 in each consuming checkout. In `lenso`,
+run `bun run prepare:runtime`, then `bun install --frozen-lockfile`, build the
+framework packages and Runtime adapter as directed by `examples/runtime/README.md`,
+and run that example's existing `generate` command. Preparation downloads and
+checksums a pinned Runtime source snapshot, builds only the TS SDK into
+`.runtime-deps/sdk`, and retains its generator/contract in `.runtime-deps/source`.
+It is a reproducible source dependency, not an npm release. Build this checkout's
+native binaries independently with Cargo; set `LENSO_RUNTIME_ROOT` or explicit
+binary overrides when running the example. No machine-specific path is stored.
+Console has its own pinned `prepare:runtime` workflow and
+`packages/console-runtime/README.md` for its existing Auth-bound host.
+
+For this checkout's current, unpublished candidate, run
+`bun run prepare:runtime --runtime-root ../lenso-runtime` in each consuming
+repository before its frozen install (adjust the checkout-relative path).
+This explicitly selects trusted local source bytes, including current edits;
+preparation records source hashes as local-candidate provenance rather than
+claiming they are the checksum-pinned remote snapshot. The default command
+continues to prepare the existing immutable snapshot. Native binaries must
+still be built separately from the same selected source. Do not confuse either
+preparation mode with npm/crates publication or precompiled distribution.
+
+From this repository, `LENSO_ROOT=../lenso bun run verify:lenso` (adjust the
+checkout-relative path) exercises actual CLI inspect/call, source-watch
+invalidation, independent Rust restart and cleanup against the prepared App.
 It changes only the source file timestamp, restoring it if the contents remain
 unchanged; no business source bytes are edited.
 

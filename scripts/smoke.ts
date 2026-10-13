@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { LogsClient } from "../examples/generated/logs";
+import { LogsClient, logsContract } from "../examples/generated/logs";
 import { RuntimeHost } from "@lenso/runtime-sdk";
 import { startLocal } from "./local";
 import { resolve } from "node:path";
@@ -53,6 +53,27 @@ try {
     { processed: 1, total: 2 },
     { processed: 2, total: 2 },
   ]);
+  // Mock SDK tests prove cancel framing, not retirement of a real kernel route.
+  const invalidStream = runtime.host.stream(
+    { namespace: "demo", service: "batch", contractVersion: logsContract.version },
+    "progress",
+    { logs },
+    {
+      contract: {
+        ...logsContract.methods.progress!,
+        output: {
+          ...logsContract.methods.progress!.output,
+          properties: {
+            ...logsContract.methods.progress!.output.properties!,
+            total: { type: "integer", maximum: 1 },
+          },
+        },
+      },
+    },
+  );
+  await expectCode(() => invalidStream.next(), "invalid_output");
+  await expectCode(() => invalidStream.next(), "invalid_output");
+  assert.equal((await runtime.host.status()).calls.length, 0);
   await expectCode(
     () =>
       runtime.host.call(
@@ -173,6 +194,7 @@ try {
         "Rust generated client",
         "generated clients",
         "stream",
+        "caller stream validation terminates real route",
         "typed business error",
         "missing service",
         "version mismatch",

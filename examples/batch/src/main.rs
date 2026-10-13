@@ -1,5 +1,5 @@
 use runtime_sdk::{
-    BusinessError, HandlerContext, Handlers, HostOptions, RuntimeError, RuntimeHost, StreamSender,
+    BusinessError, HandlerContext, HostOptions, RuntimeError, RuntimeHost, StreamSender,
 };
 use std::time::Duration;
 pub mod logs {
@@ -66,9 +66,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let port = std::env::var("LENSO_RUNTIME_PORT")
         .unwrap_or_else(|_| "7331".into())
         .parse()?;
-    let mut handlers = Handlers::new();
-    handlers.unary("aggregate", aggregate);
-    handlers.stream("progress", progress);
+    let handlers = LogsServer::new()
+        .aggregate(aggregate)
+        .progress(progress)
+        .build()?;
     let host = RuntimeHost::connect(
         HostOptions {
             namespace: "demo".into(),
@@ -105,6 +106,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn generated_server_infers_closure_types_and_rejects_incomplete_or_duplicate_bindings() {
+        assert_eq!(
+            LogsServer::new().build().err().unwrap().code,
+            "contract_mismatch"
+        );
+        let server = LogsServer::new()
+            .aggregate(|input, _context| async move {
+                Ok(AggregateOutput {
+                    count: input.logs.len() as i64,
+                    error_count: 0,
+                    total_duration_ms: 0,
+                })
+            })
+            .progress(|input, _context, output| async move {
+                output
+                    .send(ProgressOutput {
+                        processed: 0,
+                        total: input.logs.len() as i64,
+                    })
+                    .await
+            });
+        assert!(server.build().is_ok());
+        assert_eq!(
+            LogsServer::new()
+                .aggregate(aggregate)
+                .aggregate(aggregate)
+                .progress(progress)
+                .build()
+                .err()
+                .unwrap()
+                .code,
+            "contract_mismatch"
+        );
+    }
     #[test]
     fn generated_optional_integer_rejects_null_but_accepts_absence() {
         assert!(serde_json::from_str::<ProgressInput>(r#"{"logs":[]}"#)

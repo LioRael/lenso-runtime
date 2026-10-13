@@ -25,6 +25,14 @@ calls; new connections cannot deliver old responses.
   Registration permits outbound calls/status, but not inbound assignment.
   TS App integration publishes ready only after all native setup and explicit
   export binding succeed. Its owned starter pre-drains before native cleanup.
+- A caller may stop the handshake after `welcome`: `hello` alone permits
+  outbound call/status/credit/cancel, heartbeat and drain/unregister. It cannot
+  receive invocations or send ready without registration. Such a connection
+  remains `connected` in status; it has no exported contract or concurrency.
+  Current TS and Rust SDK Hosts instead register a contract (an empty method
+  set for caller-only use). Registration and ready are not prerequisites for
+  outbound calls in a future SDK. Repeated hello/register/ready is a protocol
+  error; drain prevents subsequent calls, registration and ready.
 - Host → kernel: `{"type":"heartbeat"}` (no response).
 - Host → kernel: `{"type":"call","id":"1","namespace":"demo","service":"batch","method":"aggregate","contract_version":"1","input":{},"timeout_ms":5000,"trace_id":"optional","parent_id":"optional"}`
 - Kernel → callee: `{"type":"invoke","id":"route-id","method":"aggregate","input":{},"timeout_ms":5000,"trace_id":"assigned-or-inherited","parent_id":"optional","caller":{"namespace":"demo","service":"frontend","instance":"one"}}`
@@ -92,6 +100,28 @@ Binary is unsupported. Files use bounded streams or owner-controlled references.
 Runtime validates input/output/chunks/business errors, not just generated types.
 Generate natural TypeScript client methods and serde Rust input/output/error
 types. Internal Plugin methods do not require contracts.
+Both generated clients validate the caller-held method schema: input before
+sending, output and business details before exposing a result, and each stream
+item before delivering it. This remains necessary even when the callee's
+registered contract uses the same version but weaker bounds. A caller schema
+failure is `invalid_input` or `invalid_output`; a requested version absent from
+the target service is `contract_mismatch`. No compatibility negotiation or
+coercion occurs. Stream validation/deserialization failure cancels and retires
+the current call, clears local wait/credit resources, and never delivers another
+item from that stream. The TS iterator keeps rejecting with its terminal error;
+Rust emits one error and then returns `None`.
+When a Rust terminal error and buffered chunk are simultaneously ready, the
+terminal error wins; a successful end still validates any already-buffered item.
+If either SDK cannot enqueue cancellation because its bounded writer is full,
+it closes the connection so the kernel retires the route rather than silently
+leaving it alive. The current call retains its original error; other in-flight
+calls on that connection fail. Ordinary overload rejecting new admission does
+not close a healthy connection.
+
+Rust manual bindings must exactly match the declared method set and modes.
+Missing, extra, repeated or wrong-mode bindings fail before opening a connection
+or publishing ready. The generated typed server builder delegates to that same
+validated binding layer; it does not define a second registry or contract.
 The 256 KiB limit also applies after adding the trusted invocation envelope and
 after translating response IDs. Requests that do not fit fail `invalid_input`,
 responses `invalid_output`, without dropping healthy peers or unrelated calls.

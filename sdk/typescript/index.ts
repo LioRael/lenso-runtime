@@ -279,6 +279,14 @@ export class RuntimeHost {
       this.writes--;
     });
   }
+  private cancel(id: string): void {
+    try {
+      this.send({ type: "cancel", id });
+    } catch (reason) {
+      // Close rather than leave a remote route alive after losing cancellation.
+      this.fail(reason instanceof Error ? reason : error("connection_lost"));
+    }
+  }
   private fail(reason: Error): void {
     if (this.phase === "closed") return;
     this.phase = "closed";
@@ -415,11 +423,7 @@ export class RuntimeHost {
             validateValue(schema, frame.type === "error" ? frame.details : frame.output);
           } catch {
             this.finish(frame.id, error("invalid_output"));
-            if (p.mode === "stream") {
-              try {
-                this.send({ type: "cancel", id: frame.id });
-              } catch {}
-            }
+            if (p.mode === "stream") this.cancel(frame.id);
             break;
           }
         }
@@ -493,12 +497,8 @@ export class RuntimeHost {
     const id = String(++this.sequence);
     const cancel = (code: string) => {
       if (!this.pending.has(id)) return;
-      try {
-        if (mode !== "status") this.send({ type: "cancel", id });
-      } catch {
-      } finally {
-        this.finish(id, error(code));
-      }
+      this.finish(id, error(code));
+      if (mode !== "status") this.cancel(id);
     };
     const abort = () => cancel("cancelled");
     const timer = setTimeout(() => cancel("deadline_exceeded"), timeout);
@@ -603,29 +603,21 @@ export class RuntimeHost {
           this.send({ type: "credit", id, credits: 1 });
         } catch (e) {
           this.finish(id, e as Error);
-          try {
-            this.send({ type: "cancel", id });
-          } catch {}
+          this.cancel(id);
         }
         return waiter.promise;
       },
       return: async () => {
         if (!p.ended) {
-          try {
-            this.send({ type: "cancel", id });
-          } finally {
-            this.finish(id);
-          }
+          this.finish(id);
+          this.cancel(id);
         }
         return { done: true, value: undefined };
       },
       throw: async (e) => {
         if (!p.ended) {
-          try {
-            this.send({ type: "cancel", id });
-          } finally {
-            this.finish(id, e instanceof Error ? e : error("cancelled"));
-          }
+          this.finish(id, e instanceof Error ? e : error("cancelled"));
+          this.cancel(id);
         }
         throw e;
       },

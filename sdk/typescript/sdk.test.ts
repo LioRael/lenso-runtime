@@ -1,9 +1,19 @@
 import { afterEach, expect, test } from "bun:test";
 import { createServer, type Socket } from "node:net";
 import { BusinessError, RuntimeHost, type Handler } from "@lenso/runtime-sdk";
-import { type Contract } from "./schema";
+import { type Contract, type Schema, validateValue } from "./schema";
 import { generate } from "../../tools/generate";
 import { LogsClient } from "../../examples/generated/logs";
+import schemaCases from "../../crates/sdk/tests/schema-cases.json";
+
+test("shared restricted schema fixtures agree on constraints and presence", () => {
+  for (const fixture of schemaCases) {
+    for (const value of fixture.accept)
+      expect(() => validateValue(fixture.schema as Schema, value)).not.toThrow();
+    for (const value of fixture.reject)
+      expect(() => validateValue(fixture.schema as Schema, value)).toThrow();
+  }
+});
 
 const object = {
   type: "object",
@@ -342,6 +352,23 @@ test("generator preserves optional non-null and required nullable, rejecting amb
     ),
   ).toThrow("64 scalar");
 });
+test("generator rejects schema names colliding with its client or server", () => {
+  const empty: Schema = { type: "object", properties: {}, required: [], additionalProperties: false };
+  for (const field of ["client", "server"]) {
+    const input: Schema = {
+      type: "object",
+      properties: { [field]: empty },
+      required: [field],
+      additionalProperties: false,
+    };
+    expect(() =>
+      generate(
+        { version: "1", methods: { foo: { mode: "unary", input, output: empty, error: empty } } },
+        "foo_input",
+      ),
+    ).toThrow("generated type name collision");
+  }
+});
 test("generated artifacts reproduce from the source contract", async () => {
   const contract = await Bun.file(
     new URL("../../examples/contracts/logs.json", import.meta.url),
@@ -379,6 +406,23 @@ test("generated clients validate their own response contract and cancel invalid 
   f.send({ type: "chunk", id: streamCall.id, output: { unexpected: true } });
   await expect(next).rejects.toMatchObject({ code: "invalid_output" });
   expect(await f.next("cancel")).toMatchObject({ id: streamCall.id });
+});
+// Successful cancel framing does not prove safety when the bounded writer is full.
+test("failed stream cancellation closes the connection rather than orphaning a route", async () => {
+  const f = await fixture();
+  const unrelated = f.host.call(target, "unary", {});
+  await f.next("call");
+  const client = new LogsClient(f.host, target);
+  const stream = client.progress({ logs: [{ level: "info", message: "synthetic", duration_ms: 1 }] });
+  const call = await f.next("call");
+  const next = stream.next();
+  await f.next("credit");
+  (f.host as unknown as { writes: number }).writes = 64;
+  f.send({ type: "chunk", id: call.id, output: { unexpected: true } });
+  await expect(next).rejects.toMatchObject({ code: "invalid_output" });
+  await expect(stream.next()).rejects.toMatchObject({ code: "invalid_output" });
+  await expect(unrelated).rejects.toMatchObject({ code: "overloaded" });
+  await expect(f.host.call(target, "unary", {})).rejects.toMatchObject({ code: "connection_lost" });
 });
 test("registered-only hosts can call before explicitly publishing readiness", async () => {
   const f = await fixture({}, 8, false);
