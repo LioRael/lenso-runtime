@@ -136,6 +136,21 @@ pub struct HostOptions {
     pub contract: Value,
     pub max_concurrency: usize,
 }
+impl HostOptions {
+    /// Validate local configuration without opening a connection.
+    pub fn validate(&self) -> Result<(), RuntimeError> {
+        if self.port == 0 || !(1..=64).contains(&self.max_concurrency) {
+            return Err(RuntimeError::new("invalid_input"));
+        }
+        protocol::validate_host_frame(&json!({
+            "type": "hello", "version": 1,
+            "namespace": self.namespace, "service": self.service, "instance": self.instance,
+        }))
+        .map_err(|_| RuntimeError::new("invalid_input"))?;
+        protocol::validate_contract(&self.contract)
+            .map_err(|_| RuntimeError::new("contract_mismatch"))
+    }
+}
 #[derive(Clone)]
 pub struct Target {
     pub namespace: String,
@@ -295,6 +310,8 @@ struct State {
     invocations: HashMap<String, Invocation>,
     executions: usize,
     drained: Option<Drain>,
+    handlers: Option<Arc<Handlers>>,
+    activation: Option<watch::Sender<Option<Result<(), RuntimeError>>>>,
 }
 struct Drain {
     deadline: Instant,
@@ -333,6 +350,7 @@ impl Drop for Execution {
 }
 struct Inner {
     writer: mpsc::Sender<Vec<u8>>,
+    contract: Value,
     host_handles: AtomicUsize,
     closed: Cancellation,
     accepting: AtomicBool,
@@ -377,6 +395,11 @@ impl Inner {
             invocation.cancellation.cancel();
             invocation.credits.close();
         }
+        if let Some(activation) = &state.activation {
+            if activation.borrow().is_none() {
+                activation.send_replace(Some(Err(error.clone())));
+            }
+        }
         if let Some(drain) = &state.drained {
             if drain.completion.borrow().is_none() {
                 drain.completion.send_replace(Some(Err(error)));
@@ -408,6 +431,17 @@ fn finish_pending(pending: Pending, result: Result<Value, RuntimeError>) {
 pub struct RuntimeHost {
     inner: Arc<Inner>,
 }
+struct ActivationGuard<'a> {
+    inner: &'a Inner,
+    completed: bool,
+}
+impl Drop for ActivationGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.inner.fail(RuntimeError::new("cancelled"));
+        }
+    }
+}
 impl Clone for RuntimeHost {
     fn clone(&self) -> Self {
         self.inner.host_handles.fetch_add(1, Ordering::Relaxed);
@@ -436,9 +470,14 @@ impl Drop for CallGuard {
 impl RuntimeHost {
     pub async fn connect(options: HostOptions, handlers: Handlers) -> Result<Self, RuntimeError> {
         handlers.validate(&options.contract)?;
-        if !(1..=64).contains(&options.max_concurrency) {
-            return Err(RuntimeError::new("invalid_input"));
-        }
+        let host = Self::connect_registered(options).await?;
+        host.activate(handlers).await?;
+        Ok(host)
+    }
+
+    /// Register a connection with outbound calls available, without publishing readiness.
+    pub async fn connect_registered(options: HostOptions) -> Result<Self, RuntimeError> {
+        options.validate()?;
         let setup = async {
             let mut socket = TcpStream::connect(("127.0.0.1", options.port))
                 .await
@@ -459,12 +498,6 @@ impl RuntimeHost {
             if registered["type"] != "registered" {
                 return Err(frame_error(&registered));
             }
-            write_frame(&mut socket, &json!({"type":"ready"})).await?;
-            let ready = read_frame(&mut socket).await?;
-            validate_kernel_frame(&ready)?;
-            if ready["type"] != "ready" {
-                return Err(frame_error(&ready));
-            }
             Ok((socket, heartbeat_ms))
         };
         let (socket, heartbeat_ms) = timeout(Duration::from_secs(5), setup)
@@ -473,6 +506,7 @@ impl RuntimeHost {
         let (writer, mut receiver) = mpsc::channel::<Vec<u8>>(64);
         let inner = Arc::new(Inner {
             writer,
+            contract: options.contract.clone(),
             host_handles: AtomicUsize::new(1),
             closed: Cancellation::new(),
             accepting: AtomicBool::new(true),
@@ -483,6 +517,8 @@ impl RuntimeHost {
                 invocations: HashMap::new(),
                 executions: 0,
                 drained: None,
+                handlers: None,
+                activation: None,
             }),
         });
         let (read, mut write) = socket.into_split();
@@ -510,7 +546,7 @@ impl RuntimeHost {
                     _ = reader_inner.closed.cancelled() => break,
                     result = read_frame(&mut read) => result,
                 };
-                match result.and_then(|frame| receive(&reader_inner, frame, &options, &handlers)) {
+                match result.and_then(|frame| receive(&reader_inner, frame, &options)) {
                     Ok(()) => (),
                     Err(error) if error.code == "overloaded" => (),
                     Err(error) => {
@@ -535,6 +571,69 @@ impl RuntimeHost {
             }
         });
         Ok(Self { inner })
+    }
+
+    /// Check explicit exports without publishing readiness or changing the connection.
+    pub fn validate_handlers(&self, handlers: &Handlers) -> Result<(), RuntimeError> {
+        handlers.validate(&self.inner.contract)
+    }
+
+    /// Bind the exact registered methods once and await the kernel's ready acknowledgement.
+    /// Failed or cancelled activation closes the connection.
+    pub async fn activate(&self, handlers: Handlers) -> Result<(), RuntimeError> {
+        let mut receiver = {
+            let _admission = self
+                .inner
+                .admission
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if self.inner.closed.is_cancelled() {
+                return Err(RuntimeError::new("connection_lost"));
+            }
+            if !self.inner.accepting.load(Ordering::Relaxed) {
+                return Err(RuntimeError::new("not_ready"));
+            }
+            if self.inner.state().activation.is_some() {
+                return Err(RuntimeError::new("invalid_input"));
+            }
+            if let Err(error) = handlers.validate(&self.inner.contract) {
+                self.inner.fail(error.clone());
+                return Err(error);
+            }
+            let (completion, receiver) = watch::channel(None);
+            {
+                let mut state = self.inner.state();
+                state.handlers = Some(Arc::new(handlers));
+                state.activation = Some(completion);
+            }
+            if let Err(error) = self.inner.send(json!({"type":"ready"})) {
+                self.inner.fail(error.clone());
+                return Err(error);
+            }
+            receiver
+        };
+        let mut guard = ActivationGuard {
+            inner: &self.inner,
+            completed: false,
+        };
+        let result = timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(result) = receiver.borrow_and_update().clone() {
+                    return result;
+                }
+                receiver
+                    .changed()
+                    .await
+                    .map_err(|_| RuntimeError::new("connection_lost"))?;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| Err(RuntimeError::new("deadline_exceeded")));
+        if let Err(error) = &result {
+            self.inner.fail(error.clone());
+        }
+        guard.completed = true;
+        result
     }
     fn start(
         &self,
@@ -713,6 +812,11 @@ impl RuntimeHost {
                 .unwrap_or_else(|poison| poison.into_inner());
             self.inner.accepting.store(false, Ordering::Relaxed);
             let mut state = self.inner.state();
+            if let Some(activation) = &state.activation {
+                if activation.borrow().is_none() {
+                    activation.send_replace(Some(Err(RuntimeError::new("not_ready"))));
+                }
+            }
             let start = state.drained.is_none();
             if start {
                 let (completion, _) = watch::channel(None);
@@ -958,16 +1062,26 @@ fn validate_kernel_frame(frame: &Value) -> Result<(), RuntimeError> {
     }
     Ok(())
 }
-fn receive(
-    inner: &Arc<Inner>,
-    frame: Value,
-    options: &HostOptions,
-    handlers: &Handlers,
-) -> Result<(), RuntimeError> {
+fn receive(inner: &Arc<Inner>, frame: Value, options: &HostOptions) -> Result<(), RuntimeError> {
     validate_kernel_frame(&frame)?;
     let kind = frame["type"]
         .as_str()
         .ok_or_else(|| RuntimeError::new("protocol_error"))?;
+    if kind == "ready" {
+        let state = inner.state();
+        let activation = state
+            .activation
+            .as_ref()
+            .ok_or_else(|| RuntimeError::new("protocol_error"))?;
+        if activation.borrow().is_some() {
+            return Err(RuntimeError::new("protocol_error"));
+        }
+        activation.send_replace(Some(Ok(())));
+        return Ok(());
+    }
+    if kind == "error" && frame.get("id").is_none() {
+        return Err(frame_error(&frame));
+    }
     if kind == "drained" {
         let mut state = inner.state();
         let drain = state
@@ -994,7 +1108,21 @@ fn receive(
                 .get(method)
                 .cloned()
                 .ok_or_else(|| RuntimeError::new("protocol_error"))?;
-            let handler = handlers.methods.get(method).cloned();
+            let handler = {
+                let state = inner.state();
+                let handlers = state
+                    .handlers
+                    .as_ref()
+                    .ok_or_else(|| RuntimeError::new("protocol_error"))?;
+                if !state
+                    .activation
+                    .as_ref()
+                    .is_some_and(|a| matches!(&*a.borrow(), Some(Ok(()))))
+                {
+                    return Err(RuntimeError::new("protocol_error"));
+                }
+                handlers.methods.get(method).cloned()
+            };
             let deadline = frame["timeout_ms"]
                 .as_u64()
                 .filter(|n| (1..=60000).contains(n))
@@ -1212,6 +1340,143 @@ mod tests {
             service: "worker".into(),
             contract_version: "1".into(),
         }
+    }
+
+    async fn registered_fixture(contract: Value) -> (RuntimeHost, TcpStream) {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let connect = tokio::spawn(RuntimeHost::connect_registered(HostOptions {
+            namespace: "demo".into(),
+            service: "test".into(),
+            instance: "one".into(),
+            port,
+            contract,
+            max_concurrency: 8,
+        }));
+        let (mut peer, _) = listener.accept().await.unwrap();
+        next(&mut peer, "hello").await;
+        write_frame(
+            &mut peer,
+            &json!({"type":"welcome","version":1,"generation":"1","heartbeat_ms":1000}),
+        )
+        .await
+        .unwrap();
+        next(&mut peer, "register").await;
+        write_frame(&mut peer, &json!({"type":"registered"}))
+            .await
+            .unwrap();
+        (connect.await.unwrap().unwrap(), peer)
+    }
+
+    async fn assert_closed_without_ready(peer: &mut TcpStream) {
+        timeout(Duration::from_secs(1), async {
+            while let Ok(frame) = read_frame(peer).await {
+                assert_eq!(frame["type"], "heartbeat");
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn registered_host_calls_before_ready_and_activates_once_after_ack() {
+        let (host, mut peer) = registered_fixture(json!({"version":"1","methods":{}})).await;
+        let caller = host.clone();
+        let call = tokio::spawn(async move {
+            caller
+                .call::<_, Value>(&target(), "count", &json!({}), CallOptions::default())
+                .await
+        });
+        let frame = next(&mut peer, "call").await;
+        write_frame(
+            &mut peer,
+            &json!({"type":"result","id":frame["id"],"output":42}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(call.await.unwrap().unwrap(), json!(42));
+        let activator = host.clone();
+        let activation = tokio::spawn(async move { activator.activate(Handlers::new()).await });
+        next(&mut peer, "ready").await;
+        assert!(!activation.is_finished());
+        assert_eq!(
+            host.activate(Handlers::new()).await.unwrap_err().code,
+            "invalid_input"
+        );
+        write_frame(&mut peer, &json!({"type":"ready"}))
+            .await
+            .unwrap();
+        activation.await.unwrap().unwrap();
+        assert_eq!(
+            host.activate(Handlers::new()).await.unwrap_err().code,
+            "invalid_input"
+        );
+        host.close();
+    }
+
+    #[tokio::test]
+    async fn invalid_staged_bindings_close_without_ready() {
+        let definition = json!({"mode":"unary","input":{"type":"null"},"output":{"type":"null"},"error":{"type":"null"}});
+        for variant in 0..4 {
+            let (host, mut peer) =
+                registered_fixture(json!({"version":"1","methods":{"work":definition}})).await;
+            let mut handlers = Handlers::new();
+            if variant == 1 {
+                handlers.stream("work", |_: (), _, _: StreamSender<()>| async { Ok(()) });
+            } else if variant > 1 {
+                handlers.unary("work", |_: (), _| async { Ok::<_, BusinessError<()>>(()) });
+                handlers.unary(
+                    if variant == 2 { "extra" } else { "work" },
+                    |_: (), _| async { Ok::<_, BusinessError<()>>(()) },
+                );
+            }
+            assert_eq!(
+                host.activate(handlers).await.unwrap_err().code,
+                "contract_mismatch"
+            );
+            assert_closed_without_ready(&mut peer).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_or_cancelled_activation_closes_existing_transport() {
+        for cancelled in [false, true] {
+            let (host, mut peer) = registered_fixture(json!({"version":"1","methods":{}})).await;
+            let activator = host.clone();
+            let activation = tokio::spawn(async move { activator.activate(Handlers::new()).await });
+            next(&mut peer, "ready").await;
+            if cancelled {
+                activation.abort();
+                assert!(activation.await.unwrap_err().is_cancelled());
+            } else {
+                write_frame(
+                    &mut peer,
+                    &json!({"type":"error","code":"not_ready","message":"rejected"}),
+                )
+                .await
+                .unwrap();
+                assert_eq!(activation.await.unwrap().unwrap_err().code, "not_ready");
+            }
+            assert_closed_without_ready(&mut peer).await;
+            assert!(host.inner.closed.is_cancelled());
+        }
+    }
+
+    #[tokio::test]
+    async fn drain_during_activation_never_restores_readiness() {
+        let (host, mut peer) = registered_fixture(json!({"version":"1","methods":{}})).await;
+        let activator = host.clone();
+        let activation = tokio::spawn(async move { activator.activate(Handlers::new()).await });
+        next(&mut peer, "ready").await;
+        let draining = host.clone();
+        let drain = tokio::spawn(async move { draining.drain(1000).await });
+        assert_eq!(activation.await.unwrap().unwrap_err().code, "not_ready");
+        let _ = drain.await.unwrap();
+        assert!(host.inner.closed.is_cancelled());
+        assert_eq!(
+            host.activate(Handlers::new()).await.unwrap_err().code,
+            "connection_lost"
+        );
     }
 
     #[test]
@@ -1465,6 +1730,7 @@ mod tests {
         let host = RuntimeHost {
             inner: Arc::new(Inner {
                 writer,
+                contract: json!({"version":"1","methods":{}}),
                 host_handles: AtomicUsize::new(1),
                 closed: Cancellation::new(),
                 accepting: AtomicBool::new(true),
@@ -1475,6 +1741,8 @@ mod tests {
                     invocations: HashMap::new(),
                     executions: 0,
                     drained: None,
+                    handlers: None,
+                    activation: None,
                 }),
             }),
         };
