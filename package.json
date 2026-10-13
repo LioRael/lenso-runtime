@@ -1,0 +1,25 @@
+{
+  "name": "lenso-runtime-workspace",
+  "private": true,
+  "workspaces": [
+    "sdk/typescript"
+  ],
+  "type": "module",
+  "scripts": {
+    "generate": "bun tools/generate.ts examples/contracts/logs.json examples/generated logs",
+    "build:sdk": "bun run --cwd sdk/typescript build",
+    "build": "bun run build:sdk && bun run generate && cargo build --workspace",
+    "test": "bun run build:sdk && cargo test --workspace && bun test sdk/typescript",
+    "typecheck": "tsc --noEmit",
+    "smoke": "bun scripts/smoke.ts",
+    "verify:lenso": "bun scripts/verify-lenso.ts",
+    "perf": "bun scripts/perf.ts"
+  },
+  "dependencies": {
+    "@lenso/runtime-sdk": "workspace:*"
+  },
+  "devDependencies": {
+    "@types/bun": "1.4.2",
+    "typescript": "7.0.2"
+  }
+}

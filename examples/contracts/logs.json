@@ -1,0 +1,67 @@
+{
+  "version": "1",
+  "methods": {
+    "aggregate": {
+      "mode": "unary",
+      "input": {
+        "type": "object", "additionalProperties": false, "required": ["logs"],
+        "properties": {
+          "logs": {
+            "type": "array", "maxItems": 1000,
+            "items": {
+              "type": "object", "additionalProperties": false, "required": ["level", "message", "duration_ms"],
+              "properties": {
+                "level": { "type": "string", "minLength": 1, "maxLength": 16 },
+                "message": { "type": "string", "maxLength": 128 },
+                "duration_ms": { "type": "integer", "minimum": 0, "maximum": 60000 }
+              }
+            }
+          }
+        }
+      },
+      "output": {
+        "type": "object", "additionalProperties": false, "required": ["count", "error_count", "total_duration_ms"],
+        "properties": {
+          "count": { "type": "integer", "minimum": 0, "maximum": 1000 },
+          "error_count": { "type": "integer", "minimum": 0, "maximum": 1000 },
+          "total_duration_ms": { "type": "integer", "minimum": 0, "maximum": 60000000 }
+        }
+      },
+      "error": {
+        "type": "object", "additionalProperties": false, "required": ["reason"],
+        "properties": { "reason": { "type": "string", "maxLength": 128 } }
+      }
+    },
+    "progress": {
+      "mode": "stream",
+      "input": {
+        "type": "object", "additionalProperties": false, "required": ["logs"],
+        "properties": {
+          "logs": {
+            "type": "array", "maxItems": 1000,
+            "items": {
+              "type": "object", "additionalProperties": false, "required": ["level", "message", "duration_ms"],
+              "properties": {
+                "level": { "type": "string", "minLength": 1, "maxLength": 16 },
+                "message": { "type": "string", "maxLength": 128 },
+                "duration_ms": { "type": "integer", "minimum": 0, "maximum": 60000 }
+              }
+            }
+          },
+          "delay_ms": { "type": "integer", "minimum": 0, "maximum": 1000 }
+        }
+      },
+      "output": {
+        "type": "object", "additionalProperties": false, "required": ["processed", "total"],
+        "properties": {
+          "processed": { "type": "integer", "minimum": 0, "maximum": 1000 },
+          "total": { "type": "integer", "minimum": 0, "maximum": 1000 }
+        }
+      },
+      "error": {
+        "type": "object", "additionalProperties": false, "required": ["reason"],
+        "properties": { "reason": { "type": "string", "maxLength": 128 } }
+      }
+    }
+  }
+}

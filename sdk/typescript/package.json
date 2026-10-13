@@ -1,0 +1,22 @@
+{
+  "name": "@lenso/runtime-sdk",
+  "version": "0.1.0",
+  "files": [
+    "dist"
+  ],
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./schema": {
+      "types": "./dist/schema.d.ts",
+      "import": "./dist/schema.js"
+    }
+  },
+  "scripts": {
+    "build": "bun build index.ts schema.ts --outdir dist --target bun --packages external --splitting && tsc -p tsconfig.build.json",
+    "test": "bun run build && bun test ."
+  }
+}
