@@ -7,7 +7,7 @@ principal is accepted or propagated. Production identity federation is absent.
 No public listener in v1.
 
 Every frame has `type`. Unknown/malformed frames close the connection.
-Handshake completes within 5 s. Call and status IDs share a strictly increasing
+Handshake completes within 5 s. Call, status and promotion IDs share a strictly increasing
 positive canonical decimal `u64` sequence per connection (encoded as strings).
 The kernel retains only its high-water mark, not a history set. Cancel and
 credit refer to the earlier call ID and do not advance that sequence.
@@ -45,13 +45,26 @@ calls; new connections cannot deliver old responses.
 - Host → kernel: `{"type":"drain","timeout_ms":5000}`; reject new assignments.
   Kernel → host: `{"type":"drained"}` once work terminates or deadline fails it.
 - Host → kernel: `{"type":"unregister"}` closes connection and fails calls.
+- Trusted local operator → kernel:
+  `{"type":"promote","id":"...","namespace":"demo","service":"batch","instance":"next","timeout_ms":5000}`;
+  kernel → operator: `{"type":"promoted","id":"..."}` at routing commit.
+  TS: `await host.promote({ namespace, service, instance, timeoutMs? })`.
+  `timeoutMs` defaults to 5000 and bounds old-instance drain, not ACK latency.
+  The SDK waits at most 5 s for ACK; an ACK timeout/disconnect is an uncertain
+  outcome, not proof that no commit occurred. Inspect status, never replay blindly.
 - Host → kernel: `{"type":"status","id":"..."}`; kernel →
   host: `{"type":"status","id":"...","services":[...],"calls":[...],"limits":{...}}`.
   Local trusted diagnostics, not automatic Manage exposure.
-  Services include capability names/modes; calls include trace/parent IDs.
+  Services include capability names/modes, contract version, lifecycle state,
+  generation, and additive `selected` boolean; calls include trace/parent IDs.
   `recent` retains at most 64 terminal outcome/code/duration records, never input
   or output payloads. A snapshot exceeding the frame budget fails with
   `overloaded`; the diagnostic connection is not disconnected.
+  Additive `queue_ms` measures kernel admission to assignment (or terminal
+  failure when never assigned); `execution_ms` measures assignment to terminal
+  response/failure, or is null for never-assigned work. Execution includes wire,
+  SDK validation/scheduling and stream-consumer backpressure, not just business
+  execution. Business handler timing must be measured by the host itself.
 
 Error codes: `service_not_found`, `not_ready`, `overloaded`, `deadline_exceeded`,
 `connection_lost`, `cancelled`, `contract_mismatch`, `invalid_input`,
@@ -66,6 +79,40 @@ per connection, 256 KiB/frame, 60 s maximum deadline, 5 s heartbeat expiry.
 Registered concurrency is 1–64. Choose least-busy ready matching instance.
 Deadlines begin at admission, including queue time. Same scoped service/version
 must register structurally equal contracts. No automatic retries or replay.
+
+## Trusted local cutover
+
+Promotion is an explicit LOCAL development operator action, not an authenticated
+management API. Any trusted loopback connection may request it after hello.
+It runs no arbitrary code and adds no CLI, MCP or Manage tool exposure.
+
+Before selection, same-service ready instances remain least-busy. For staged
+replacement, promote the initial instance before starting the next candidate:
+later candidates may register/ready but cannot receive calls until promoted.
+Promotion requires exactly one ready, non-draining target instance. Missing,
+unready or ambiguous targets fail `not_ready`. It compares the entire contract,
+including version, schemas, modes and exported method set, against all serving
+same-scope instances, admitted calls, and any retained selected contract.
+Any difference, including a version bump, fails `contract_mismatch`. Registration
+failure or rejected promotion never changes the previous routing selection.
+Validation and routing commit happen atomically in the kernel actor.
+
+Only new assignment changes: admitted but unassigned queued calls use the
+selected candidate. Already assigned old calls/streams keep their old route,
+credits and deadline. Other existing scoped instances stop new admission and
+enter bounded drain. At its deadline remaining old assigned work receives
+`deadline_exceeded`, with cancellation sent to the old callee and outcome
+reported in recent status. Kernel-driven drain emits no unsolicited lifecycle
+frame to old SDKs. Explicit SDK drain still works and may shorten, never extend,
+the existing bound; it also drains outbound work. Promotion ACK does not wait
+for old work to finish. Use status or old SDK drain before process cleanup.
+
+Selection is pinned to connection generation. Selected disconnect fails active
+work and fails closed for new work (`not_ready`); no fallback to drained old
+instances or a reconnect with the same name. Explicitly promote a compatible
+ready replacement. Selection and its contract survive disconnect until kernel
+restart, bounded to 128 distinct promoted scopes; further scopes fail
+`overloaded`. No global retry, rollback, or version negotiation occurs.
 
 Streams begin with zero credit. SDK grants one on consumer `next()`. At most
 16 outstanding credits; each chunk spends one. Chunk without credit fails the

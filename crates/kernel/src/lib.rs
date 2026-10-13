@@ -43,8 +43,14 @@ struct Host {
     ready: bool,
     drain: Option<Instant>,
     drained: bool,
+    notify_drained: bool,
     seen: Instant,
     last_id: u64,
+}
+
+struct Selection {
+    generation: u64,
+    contract: Arc<Value>,
 }
 
 struct Call {
@@ -60,6 +66,7 @@ struct Call {
     trace: String,
     parent: Option<String>,
     started: Instant,
+    assigned: Option<Instant>,
     deadline: Instant,
     callee: Option<u64>,
     credits: u64,
@@ -72,6 +79,7 @@ struct Actor {
     recent: VecDeque<Value>,
     failed_writers: HashSet<u64>,
     next_route: u64,
+    selections: BTreeMap<(String, String), Selection>,
 }
 
 fn string(frame: &Value, key: &str) -> String {
@@ -122,10 +130,14 @@ impl Actor {
         if self.calls.values().filter(|c| c.callee.is_some()).count() >= ACTIVE {
             return None;
         }
+        let selected = self
+            .selections
+            .get(&(namespace.to_owned(), service.to_owned()));
         self.hosts
             .iter()
-            .filter(|(_, h)| {
-                h.ready
+            .filter(|(id, h)| {
+                selected.is_none_or(|s| s.generation == **id)
+                    && h.ready
                     && h.drain.is_none()
                     && h.identity
                         .as_ref()
@@ -162,11 +174,14 @@ impl Actor {
             if self.recent.len() == 64 {
                 self.recent.pop_front();
             }
+            let ended = Instant::now();
             self.recent.push_back(json!({
                 "id":route.to_string(),"namespace":call.namespace,"service":call.service,
                 "method":call.method,"trace_id":call.trace,"parent_id":call.parent,
                 "outcome":frame["type"],"code":frame.get("code"),
-                "duration_ms":call.started.elapsed().as_secs_f64() * 1000.0
+                "duration_ms":ended.duration_since(call.started).as_secs_f64() * 1000.0,
+                "queue_ms":call.assigned.unwrap_or(ended).duration_since(call.started).as_secs_f64() * 1000.0,
+                "execution_ms":call.assigned.map(|assigned| ended.duration_since(assigned).as_secs_f64() * 1000.0)
             }));
             if cancel {
                 if let Some(callee) = call.callee {
@@ -230,7 +245,9 @@ impl Actor {
             let routes: Vec<_> = self
                 .calls
                 .iter()
-                .filter(|(_, c)| c.caller == host || c.callee == Some(host))
+                .filter(|(_, c)| {
+                    c.callee == Some(host) || (self.hosts[&host].notify_drained && c.caller == host)
+                })
                 .map(|(id, _)| *id)
                 .collect();
             if deadline.is_some_and(|d| d <= now) {
@@ -242,7 +259,9 @@ impl Actor {
                 if let Some(h) = self.hosts.get_mut(&host) {
                     h.drained = true;
                 }
-                self.send(host, json!({"type":"drained"}));
+                if self.hosts[&host].notify_drained {
+                    self.send(host, json!({"type":"drained"}));
+                }
             }
         }
         while let Some(host) = self.failed_writers.iter().next().copied() {
@@ -282,6 +301,7 @@ impl Actor {
                 let credits = call.credits;
                 if let Some(call) = self.calls.get_mut(&route) {
                     call.callee = Some(callee);
+                    call.assigned = Some(Instant::now());
                 }
                 self.send(callee, invoke);
                 if credits > 0 {
@@ -356,19 +376,25 @@ impl Actor {
             "call" => self.admit(host, frame),
             "result" | "chunk" | "end" | "error" => self.response(host, frame),
             "credit" | "cancel" => self.control(host, frame),
+            "promote" => {
+                if self.request_id(host, &frame) {
+                    self.promote(host, &frame);
+                }
+            }
             "drain" => {
-                if self.hosts[&host].drain.is_some() {
+                if self.hosts[&host].notify_drained {
                     self.protocol_error(host);
                     return;
                 }
                 if let Some(h) = self.hosts.get_mut(&host) {
                     h.ready = false;
-                    h.drain = Some(
-                        Instant::now()
-                            + Duration::from_millis(
-                                frame["timeout_ms"].as_u64().unwrap_or(0).min(60_000),
-                            ),
-                    );
+                    h.notify_drained = true;
+                    h.drained = false;
+                    let deadline = Instant::now()
+                        + Duration::from_millis(
+                            frame["timeout_ms"].as_u64().unwrap_or(0).min(60_000),
+                        );
+                    h.drain = Some(h.drain.map_or(deadline, |old| old.min(deadline)));
                 }
             }
             "unregister" => self.disconnect(host),
@@ -379,6 +405,84 @@ impl Actor {
             }
             _ => self.protocol_error(host),
         }
+    }
+
+    fn promote(&mut self, operator: u64, frame: &Value) {
+        let id = string(frame, "id");
+        let namespace = string(frame, "namespace");
+        let service = string(frame, "service");
+        let instance = string(frame, "instance");
+        let key = (namespace.clone(), service.clone());
+        let milliseconds = frame["timeout_ms"].as_u64().unwrap_or(0);
+        if !(1..=60_000).contains(&milliseconds) {
+            self.error(operator, Some(&id), "invalid_input");
+            return;
+        }
+        let candidates: Vec<_> = self
+            .hosts
+            .iter()
+            .filter(|(_, h)| {
+                h.identity.as_ref().is_some_and(|i| {
+                    i.namespace == namespace && i.service == service && i.instance == instance
+                }) && h.ready
+                    && h.drain.is_none()
+                    && h.contract.is_some()
+            })
+            .map(|(generation, _)| *generation)
+            .collect();
+        if candidates.len() != 1 {
+            self.error(operator, Some(&id), "not_ready");
+            return;
+        }
+        let candidate = candidates[0];
+        let Some(contract) = self.hosts[&candidate].contract.as_ref().map(Arc::clone) else {
+            return;
+        };
+        let incompatible = self.hosts.values().any(|h| {
+            h.ready
+                && h.drain.is_none()
+                && h.identity
+                    .as_ref()
+                    .is_some_and(|i| i.namespace == namespace && i.service == service)
+                && h.contract
+                    .as_ref()
+                    .is_some_and(|c| !json_equivalent(c, &contract))
+        }) || self.calls.values().any(|c| {
+            c.namespace == namespace
+                && c.service == service
+                && !json_equivalent(&c.contract, &contract)
+        }) || self
+            .selections
+            .get(&key)
+            .is_some_and(|s| !json_equivalent(&s.contract, &contract));
+        if incompatible {
+            self.error(operator, Some(&id), "contract_mismatch");
+            return;
+        }
+        if !self.selections.contains_key(&key) && self.selections.len() >= CONNECTIONS {
+            self.error(operator, Some(&id), "overloaded");
+            return;
+        }
+        // The actor validates and commits without yielding; unassigned calls follow the selection.
+        self.selections.insert(
+            key,
+            Selection {
+                generation: candidate,
+                contract,
+            },
+        );
+        let deadline = Instant::now() + Duration::from_millis(milliseconds);
+        for (generation, h) in &mut self.hosts {
+            if *generation != candidate
+                && h.identity
+                    .as_ref()
+                    .is_some_and(|i| i.namespace == namespace && i.service == service)
+            {
+                h.ready = false;
+                h.drain = Some(h.drain.map_or(deadline, |old| old.min(deadline)));
+            }
+        }
+        self.send(operator, json!({"type":"promoted","id":id}));
     }
 
     fn register(&mut self, host: u64, frame: &Value) {
@@ -412,7 +516,14 @@ impl Actor {
                     && c.service == identity.service
                     && c.version == frame["contract"]["version"]
                     && !json_equivalent(&c.contract, &frame["contract"])
-            });
+            })
+            || self
+                .selections
+                .get(&(identity.namespace.clone(), identity.service.clone()))
+                .is_some_and(|s| {
+                    s.contract["version"] == frame["contract"]["version"]
+                        && !json_equivalent(&s.contract, &frame["contract"])
+                });
         if conflict {
             self.error(host, None, "contract_mismatch");
             self.failed_writers.insert(host);
@@ -467,8 +578,13 @@ impl Actor {
             self.error(host, Some(&id), "contract_mismatch");
             return;
         }
-        if !matching.iter().any(|h| {
-            h.ready
+        let selected = self.selections.get(&(namespace.clone(), service.clone()));
+        if !self.hosts.iter().any(|(generation, h)| {
+            selected.is_none_or(|s| s.generation == *generation)
+                && h.identity
+                    .as_ref()
+                    .is_some_and(|i| i.namespace == namespace && i.service == service)
+                && h.ready
                 && h.drain.is_none()
                 && h.contract.as_ref().is_some_and(|c| c["version"] == version)
         }) {
@@ -516,6 +632,7 @@ impl Actor {
                 .and_then(Value::as_str)
                 .map(str::to_owned),
             started: Instant::now(),
+            assigned: None,
             deadline: Instant::now() + Duration::from_millis(milliseconds),
             callee: None,
             credits: 0,
@@ -648,6 +765,7 @@ impl Actor {
         let services: Vec<_> = self.hosts.iter().filter_map(|(id, h)| h.identity.as_ref().map(|i| json!({
             "namespace":i.namespace,"service":i.service,"instance":i.instance,"generation":id.to_string(),
             "contract_version":h.contract.as_ref().map(|c| &c["version"]),
+            "selected":self.selections.get(&(i.namespace.clone(), i.service.clone())).is_some_and(|s| s.generation == *id),
             "capabilities":h.contract.as_ref().and_then(|c| c["methods"].as_object()).map(|methods|
                 methods.iter().map(|(name, definition)| json!({"method":name,"mode":definition["mode"]})).collect::<Vec<_>>()).unwrap_or_default(),
             "state":if h.drained {"drained"} else if h.drain.is_some() {"draining"} else if h.ready {"ready"} else if h.contract.is_some() {"registered"} else {"connected"},
@@ -755,7 +873,7 @@ pub async fn serve(listener: TcpListener, shutdown: impl Future<Output = ()>) ->
                 let (out, outbound) = mpsc::channel(OUTBOUND);
                 let (close, closed) = watch::channel(());
                 actor.hosts.insert(generation, Host { out, _close:close, identity:None, contract:None, concurrency:0, ready:false,
-                    drain:None, drained:false, seen:Instant::now(), last_id:0 });
+                    drain:None, drained:false, notify_drained:false, seen:Instant::now(), last_id:0 });
                 let events = events.clone();
                 tasks.spawn(async move {
                     connection(stream, next, events.clone(), outbound, closed).await;

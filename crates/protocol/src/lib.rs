@@ -407,6 +407,10 @@ pub fn validate_host_frame(value: &Value) -> Result<(), ValidationError> {
         "end" | "cancel" | "status" => (&["id"], &[]),
         "credit" => (&["id", "credits"], &[]),
         "drain" => (&["timeout_ms"], &[]),
+        "promote" => (
+            &["id", "namespace", "service", "instance", "timeout_ms"],
+            &[],
+        ),
         _ => return fail("unknown frame type"),
     };
     if required.iter().any(|key| !obj.contains_key(*key))
@@ -465,6 +469,21 @@ pub fn validate_host_frame(value: &Value) -> Result<(), ValidationError> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn validates_only_scoped_promotion_shape() {
+        let frame = json!({"type":"promote","id":"1","namespace":"demo","service":"worker","instance":"new","timeout_ms":5000});
+        assert!(validate_host_frame(&frame).is_ok());
+        let mut unknown = frame.clone();
+        unknown["execute"] = json!("anything");
+        assert!(validate_host_frame(&unknown).is_err());
+        let mut missing = frame.clone();
+        missing.as_object_mut().unwrap().remove("instance");
+        assert!(validate_host_frame(&missing).is_err());
+        let mut invalid = frame;
+        invalid["timeout_ms"] = json!(-1);
+        assert!(validate_host_frame(&invalid).is_err());
+    }
 
     #[test]
     fn rejects_unsupported_and_malformed_contracts() {

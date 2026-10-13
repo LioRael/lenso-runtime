@@ -99,6 +99,29 @@ async function fixture(handlers: Record<string, Handler> = {}, maxConcurrency = 
     });
   return { host, next, send, invoke, frames, disconnect: () => peer.destroy() };
 }
+test("promotion uses scoped operator frame and commit acknowledgement, with no retry", async () => {
+  const f = await fixture();
+  const promoted = f.host.promote({ namespace: "demo", service: "worker", instance: "new", timeoutMs: 40 });
+  const request = await f.next("promote");
+  expect(request).toEqual({
+    type: "promote", id: "1", namespace: "demo", service: "worker", instance: "new", timeout_ms: 40,
+  });
+  f.send({ type: "promoted", id: request.id });
+  expect(await promoted).toBeUndefined();
+  const incompatible = f.host.promote({ namespace: "demo", service: "worker", instance: "bad" });
+  const rejected = await f.next("promote");
+  expect(rejected.timeout_ms).toBe(5000);
+  f.send({ type: "error", id: rejected.id, code: "contract_mismatch", message: "contract_mismatch" });
+  await expect(incompatible).rejects.toMatchObject({ code: "contract_mismatch" });
+  await expect(f.host.promote({ namespace: "", service: "worker", instance: "new" })).rejects.toMatchObject({ code: "invalid_input" });
+  await expect(f.host.promote({ namespace: "demo", service: "worker", instance: "new", timeoutMs: 60001 })).rejects.toMatchObject({ code: "invalid_input" });
+  const pending = f.host.promote({ namespace: "demo", service: "worker", instance: "lost" });
+  await f.next("promote");
+  f.disconnect();
+  await expect(pending).rejects.toMatchObject({ code: "connection_lost" });
+  expect(f.frames.filter((frame) => frame.type === "cancel")).toHaveLength(0);
+});
+
 test("unary, status and disconnect fail pending work without retry", async () => {
   const f = await fixture();
   const call = f.host.call(target, "unary", { value: 3 });

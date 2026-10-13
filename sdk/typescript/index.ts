@@ -18,6 +18,12 @@ export class BusinessError<E> extends RuntimeError<E> {
   }
 }
 export type Target = { namespace: string; service: string; contractVersion: string };
+export type PromoteOptions = {
+  namespace: string;
+  service: string;
+  instance: string;
+  timeoutMs?: number;
+};
 export type CallOptions = {
   timeoutMs?: number;
   signal?: AbortSignal;
@@ -46,11 +52,36 @@ export type HostOptions = {
   handlers?: Record<string, Handler>;
   ready?: boolean;
 };
+export type ServiceStatus = {
+  namespace: string;
+  service: string;
+  instance: string;
+  generation: string;
+  contract_version: string | null;
+  capabilities: { method: string; mode: "unary" | "stream" }[];
+  state: "connected" | "registered" | "ready" | "draining" | "drained";
+  active_calls: number;
+  max_concurrency: number;
+  selected?: boolean;
+};
+export type RecentCallStatus = {
+  id: string;
+  namespace: string;
+  service: string;
+  method: string;
+  trace_id: string;
+  parent_id: string | null;
+  outcome: string;
+  code: string | null;
+  duration_ms: number;
+  queue_ms?: number;
+  execution_ms?: number | null;
+};
 export type Status = {
-  services: unknown[];
+  services: ServiceStatus[];
   calls: unknown[];
   limits: Record<string, unknown>;
-  recent?: unknown[];
+  recent?: RecentCallStatus[];
 };
 type Frame = Record<string, any>;
 type Deferred<T> = { promise: Promise<T>; resolve(value: T): void; reject(error: unknown): void };
@@ -65,7 +96,7 @@ function deferred<T>(): Deferred<T> {
   return { promise, resolve, reject };
 }
 type Pending = {
-  mode: "unary" | "stream" | "status";
+  mode: "unary" | "stream" | "status" | "promote";
   contract?: Contract["methods"][string];
   result?: Deferred<any>;
   next: Deferred<IteratorResult<any>>[];
@@ -155,6 +186,7 @@ const frameFields: Record<string, [string[], string[]]> = {
   registered: [[], []],
   ready: [[], []],
   drained: [[], []],
+  promoted: [["id"], []],
   invoke: [["id", "method", "input", "timeout_ms", "trace_id", "caller"], ["parent_id"]],
   credit: [["id", "credits"], []],
   cancel: [["id"], []],
@@ -386,6 +418,14 @@ export class RuntimeHost {
         invocation?.wake?.();
         break;
       }
+      case "promoted": {
+        const p = this.pending.get(frame.id);
+        if (!p) return;
+        if (p.mode !== "promote") throw error("protocol_error");
+        p.result!.resolve(undefined);
+        this.finish(frame.id);
+        break;
+      }
       case "status": {
         const p = this.pending.get(frame.id);
         if (!p) return;
@@ -471,12 +511,13 @@ export class RuntimeHost {
     input: unknown,
     mode: Pending["mode"],
     options: CallOptions,
+    promotion?: PromoteOptions,
   ): [string, Pending] {
     if (this.phase === "closed") throw error("connection_lost");
     if (this.phase !== "active" || !this.accepting) throw error("not_ready");
     if (this.pending.size >= 192) throw error("overloaded");
     if (options.signal?.aborted) throw error("cancelled");
-    if (mode !== "status") validateWireValue(input);
+    if (mode === "unary" || mode === "stream") validateWireValue(input);
     if (options.contract) {
       if (options.contract.mode !== mode) throw error("invalid_input");
       try {
@@ -498,7 +539,7 @@ export class RuntimeHost {
     const cancel = (code: string) => {
       if (!this.pending.has(id)) return;
       this.finish(id, error(code));
-      if (mode !== "status") this.cancel(id);
+      if (mode === "unary" || mode === "stream") this.cancel(id);
     };
     const abort = () => cancel("cancelled");
     const timer = setTimeout(() => cancel("deadline_exceeded"), timeout);
@@ -517,20 +558,29 @@ export class RuntimeHost {
     options.signal?.addEventListener("abort", abort, { once: true });
     try {
       this.send(
-        mode === "status"
-          ? { type: "status", id }
-          : {
-              type: "call",
+        mode === "promote"
+          ? {
+              type: "promote",
               id,
-              namespace: target!.namespace,
-              service: target!.service,
-              contract_version: target!.contractVersion,
-              method,
-              input,
-              timeout_ms: timeout,
-              trace_id: options.traceId,
-              parent_id: options.parentId,
-            },
+              namespace: promotion!.namespace,
+              service: promotion!.service,
+              instance: promotion!.instance,
+              timeout_ms: promotion!.timeoutMs ?? 5000,
+            }
+          : mode === "status"
+            ? { type: "status", id }
+            : {
+                type: "call",
+                id,
+                namespace: target!.namespace,
+                service: target!.service,
+                contract_version: target!.contractVersion,
+                method,
+                input,
+                timeout_ms: timeout,
+                trace_id: options.traceId,
+                parent_id: options.parentId,
+              },
       );
     } catch (e) {
       p.cleanup();
@@ -566,6 +616,20 @@ export class RuntimeHost {
   status(options: CallOptions = {}): Promise<Status> {
     try {
       return this.start(undefined, "", undefined, "status", options)[1].result!.promise;
+    } catch (e) {
+      return Promise.reject(e);
+    }
+  }
+  /** Trusted local operator cutover. Resolves at routing commit, not after old work drains. */
+  promote(options: PromoteOptions): Promise<void> {
+    try {
+      for (const field of [options.namespace, options.service, options.instance])
+        if (typeof field !== "string" || !field || Buffer.byteLength(field) > 256)
+          throw error("invalid_input");
+      const timeout = options.timeoutMs ?? 5000;
+      if (!Number.isInteger(timeout) || timeout < 1 || timeout > 60000)
+        throw error("invalid_input");
+      return this.start(undefined, "", undefined, "promote", {}, options)[1].result!.promise;
     } catch (e) {
       return Promise.reject(e);
     }

@@ -40,6 +40,9 @@ struct Host {
 
 impl Host {
     async fn connect(address: SocketAddr, service: &str) -> Self {
+        Self::connect_instance(address, service, "one").await
+    }
+    async fn connect_instance(address: SocketAddr, service: &str, instance: &str) -> Self {
         let stream = TcpStream::connect(address).await.unwrap();
         let (read, write) = stream.into_split();
         let mut host = Self {
@@ -47,7 +50,7 @@ impl Host {
             write,
             generation: Value::Null,
         };
-        host.send(json!({"type":"hello","version":1,"namespace":"demo","service":service,"instance":"one"})).await;
+        host.send(json!({"type":"hello","version":1,"namespace":"demo","service":service,"instance":instance})).await;
         let welcome = host.recv().await;
         assert_eq!(welcome["type"], "welcome");
         host.generation = welcome["generation"].clone();
@@ -81,6 +84,164 @@ impl Host {
 
 fn contract(mode: &str) -> Value {
     json!({"version":"1","methods":{"run":{"mode":mode,"input":{"type":"integer"},"output":{"type":"integer"},"error":{"type":"string"}}}})
+}
+
+#[tokio::test]
+async fn promotion_preserves_old_stream_and_routes_waiting_and_new_calls_to_candidate() {
+    let server = Server::start().await;
+    let mut caller = Host::connect(server.address, "front").await;
+    let mut old = Host::connect_instance(server.address, "batch", "old").await;
+    old.register("stream").await;
+    caller.send(json!({"type":"promote","id":"1","namespace":"demo","service":"batch","instance":"old","timeout_ms":1000})).await;
+    assert_eq!(caller.recv().await["type"], "promoted");
+    caller.call("2", 2000).await;
+    let active = old.recv().await;
+    caller
+        .send(json!({"type":"credit","id":"2","credits":1}))
+        .await;
+    assert_eq!(old.recv().await["type"], "credit");
+    caller.call("3", 2000).await;
+    caller.send(json!({"type":"status","id":"4"})).await;
+    let before = caller.recv().await;
+    assert_eq!(before["calls"][1]["state"], "waiting");
+
+    let mut new = Host::connect_instance(server.address, "batch", "new").await;
+    new.register("stream").await;
+    caller.send(json!({"type":"promote","id":"5","namespace":"demo","service":"batch","instance":"new","timeout_ms":1000})).await;
+    assert_eq!(caller.recv().await, json!({"type":"promoted","id":"5"}));
+    let waiting = new.recv().await;
+    assert_eq!(waiting["type"], "invoke");
+    old.send(json!({"type":"chunk","id":active["id"],"output":7}))
+        .await;
+    assert_eq!(
+        caller.recv().await,
+        json!({"type":"chunk","id":"2","output":7})
+    );
+    new.send(json!({"type":"end","id":waiting["id"]})).await;
+    assert_eq!(caller.recv().await["id"], "3");
+    caller.call("6", 2000).await;
+    let fresh = new.recv().await;
+    assert_eq!(fresh["type"], "invoke");
+    old.send(json!({"type":"end","id":active["id"]})).await;
+    assert_eq!(caller.recv().await, json!({"type":"end","id":"2"}));
+    new.send(json!({"type":"end","id":fresh["id"]})).await;
+    assert_eq!(caller.recv().await["id"], "6");
+    caller.send(json!({"type":"status","id":"7"})).await;
+    let status = caller.recv().await;
+    let services = status["services"].as_array().unwrap();
+    let previous = services.iter().find(|s| s["instance"] == "old").unwrap();
+    let selected = services.iter().find(|s| s["instance"] == "new").unwrap();
+    assert_eq!(previous["state"], "drained");
+    assert_eq!(selected["selected"], true);
+    assert_eq!(selected["contract_version"], "1");
+    assert_eq!(selected["capabilities"][0]["mode"], "stream");
+    let recent = status["recent"].as_array().unwrap();
+    assert!(recent
+        .iter()
+        .all(|r| r["queue_ms"].as_f64().is_some_and(|n| n >= 0.0)));
+    assert!(recent
+        .iter()
+        .all(|r| r["execution_ms"].as_f64().is_some_and(|n| n >= 0.0)));
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn incompatible_missing_and_unready_promotions_leave_old_selection_unchanged() {
+    let server = Server::start().await;
+    let mut caller = Host::connect(server.address, "front").await;
+    let mut old = Host::connect_instance(server.address, "batch", "old").await;
+    old.register("unary").await;
+    caller.send(json!({"type":"promote","id":"1","namespace":"demo","service":"batch","instance":"old","timeout_ms":1000})).await;
+    assert_eq!(caller.recv().await["type"], "promoted");
+    let mut candidate = Host::connect_instance(server.address, "batch", "candidate").await;
+    let mut bumped = contract("unary");
+    bumped["version"] = json!("2");
+    candidate
+        .send(json!({"type":"register","max_concurrency":1,"contract":bumped}))
+        .await;
+    assert_eq!(candidate.recv().await["type"], "registered");
+    caller.send(json!({"type":"promote","id":"2","namespace":"demo","service":"batch","instance":"candidate","timeout_ms":1000})).await;
+    assert_eq!(caller.recv().await["code"], "not_ready");
+    candidate.send(json!({"type":"ready"})).await;
+    assert_eq!(candidate.recv().await["type"], "ready");
+    caller.send(json!({"type":"promote","id":"3","namespace":"demo","service":"batch","instance":"candidate","timeout_ms":1000})).await;
+    assert_eq!(caller.recv().await["code"], "contract_mismatch");
+    caller.send(json!({"type":"promote","id":"4","namespace":"demo","service":"batch","instance":"missing","timeout_ms":1000})).await;
+    assert_eq!(caller.recv().await["code"], "not_ready");
+    let mut bad = Host::connect_instance(server.address, "batch", "bad").await;
+    let mut changed = contract("unary");
+    changed["methods"]["run"]["output"]["maximum"] = json!(1);
+    bad.send(json!({"type":"register","max_concurrency":1,"contract":changed}))
+        .await;
+    assert_eq!(bad.recv().await["code"], "contract_mismatch");
+    caller.call("5", 1000).await;
+    let invoke = old.recv().await;
+    old.send(json!({"type":"result","id":invoke["id"],"output":9}))
+        .await;
+    assert_eq!(caller.recv().await["output"], 9);
+    caller.send(json!({"type":"status","id":"6"})).await;
+    let status = caller.recv().await;
+    assert!(status["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|s| s["instance"] == "old" && s["selected"] == true && s["state"] == "ready"));
+    server.finish().await;
+}
+
+#[tokio::test]
+async fn promotion_drain_deadline_cancels_old_work_and_selected_disconnect_fails_closed() {
+    let server = Server::start().await;
+    let mut caller = Host::connect(server.address, "front").await;
+    let mut old = Host::connect_instance(server.address, "batch", "old").await;
+    old.register("stream").await;
+    caller.call("1", 2000).await;
+    let active = old.recv().await;
+    let mut new = Host::connect_instance(server.address, "batch", "new").await;
+    new.register("stream").await;
+    caller.send(json!({"type":"promote","id":"2","namespace":"demo","service":"batch","instance":"new","timeout_ms":30})).await;
+    assert_eq!(caller.recv().await["type"], "promoted");
+    old.send(json!({"type":"drain","timeout_ms":1000})).await;
+    assert_eq!(
+        caller.recv().await,
+        json!({"type":"error","id":"1","code":"deadline_exceeded","message":"deadline_exceeded"})
+    );
+    assert_eq!(old.recv().await, json!({"type":"cancel","id":active["id"]}));
+    assert_eq!(old.recv().await, json!({"type":"drained"}));
+    new.send(json!({"type":"unregister"})).await;
+    let mut line = String::new();
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), new.read.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap(),
+        0
+    );
+    caller.send(json!({"type":"status","id":"3"})).await;
+    let status = caller.recv().await;
+    assert!(status["services"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|s| s["instance"] != "new"));
+    assert_eq!(status["recent"][0]["code"], "deadline_exceeded");
+    let measured = &status["recent"][0];
+    assert!(
+        (measured["duration_ms"].as_f64().unwrap()
+            - measured["queue_ms"].as_f64().unwrap()
+            - measured["execution_ms"].as_f64().unwrap())
+        .abs()
+            < 1e-9
+    );
+    let mut replacement = Host::connect_instance(server.address, "batch", "replacement").await;
+    replacement.register("stream").await;
+    caller.call("20", 1000).await;
+    assert_eq!(caller.recv().await["code"], "not_ready");
+    caller.send(json!({"type":"promote","id":"21","namespace":"demo","service":"batch","instance":"replacement","timeout_ms":1000})).await;
+    assert_eq!(caller.recv().await["type"], "promoted");
+    caller.call("22", 1000).await;
+    assert_eq!(replacement.recv().await["type"], "invoke");
+    server.finish().await;
 }
 
 // Prevents cross-connection forgery while proving route/client ID translation.
