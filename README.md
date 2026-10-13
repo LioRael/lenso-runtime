@@ -78,6 +78,13 @@ See `examples/batch/src/main.rs` for the async handlers and host options.
 Manual `Handlers::unary` / `Handlers::stream` remain available and use the same
 exact method/mode/duplicate validation. Failed initialization never sends ready
 or leaves background connection tasks running.
+For native assembly requiring outbound clients during setup, Rust additionally
+provides `RuntimeHost::connect_registered(options)`. It validates local options
+and registers without ready. After setup, check all explicit bindings with
+`host.validate_handlers(&handlers)`, then await `host.activate(handlers)`.
+Activation validates again, binds once and waits for the ready acknowledgment;
+failure or cancellation closes the connection. `connect` remains the convenience
+register-and-activate API for SDK-only services.
 Rust's low-level generic `call` / `stream` only deserialize; use the generated
 client or `call_contract` / `stream_contract` for caller-side schema validation.
 For nested calls, explicitly forward trace and cancellation context:
@@ -119,6 +126,27 @@ claiming they are the checksum-pinned remote snapshot. The default command
 continues to prepare the existing immutable snapshot. Native binaries must
 still be built separately from the same selected source. Do not confuse either
 preparation mode with npm/crates publication or precompiled distribution.
+
+## Native Rust application integration
+
+Rust plugin Core, business plugins, the optional App adapter and native App
+examples belong to [lenso-rust](https://github.com/LioRael/lenso-rust), not this
+Runtime workspace. Runtime owns only the kernel, protocol, SDK and SDK examples;
+it does not depend on Rust plugin Core.
+
+The existing smoke defaults to this repository's SDK-only examples. To verify
+the separate native plugin App, first build both repositories, then explicitly
+select its prebuilt binaries:
+
+```sh
+LENSO_RUST_ROOT=/path/to/lenso-rust bun run smoke
+```
+
+The selected directory must contain `target/debug/logs-batch` and `logs-client`.
+The kernel and TypeScript SDK remain this repository's own builds. Smoke uses
+the same generated contract for TS→Rust and Rust→TS calls, waits for actual
+readiness and owns its process/port cleanup. No sibling directory is discovered,
+and no missing selected App is silently replaced with the SDK-only example.
 
 From this repository, `LENSO_ROOT=../lenso bun run verify:lenso` (adjust the
 checkout-relative path) exercises actual CLI inspect/call, source-watch

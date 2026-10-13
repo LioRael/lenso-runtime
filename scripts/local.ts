@@ -57,10 +57,14 @@ export async function startLocal(profile = "debug") {
   const port = await reservePort();
   const directory = resolve(import.meta.dir, "..", "target", profile);
   const kernelPath = resolve(directory, "lenso-runtime");
-  const batchPath = resolve(directory, "logs-batch");
+  const appDirectory = process.env.LENSO_RUST_ROOT
+    ? resolve(process.env.LENSO_RUST_ROOT, "target", profile)
+    : directory;
+  const batchPath = resolve(appDirectory, "logs-batch");
+  const clientPath = resolve(appDirectory, "logs-client");
   if (!(await Bun.file(kernelPath).exists()) || !(await Bun.file(batchPath).exists())) {
     throw new Error(
-      `Build first: cargo build --workspace${profile === "release" ? " --release" : ""}`,
+      `Build Runtime and selected Rust binaries first: ${kernelPath}, ${batchPath}`,
     );
   }
   const kernel = Bun.spawn([kernelPath, "--listen", `127.0.0.1:${port}`], {
@@ -86,9 +90,14 @@ export async function startLocal(profile = "debug") {
     const deadline = Date.now() + 5000;
     while (true) {
       const snapshot = await host.status();
-      if (JSON.stringify(snapshot.services).includes('"batch"')) break;
+      if (snapshot.services.some((service) =>
+        typeof service === "object" && service !== null &&
+        "namespace" in service && service.namespace === "demo" &&
+        "service" in service && service.service === "batch" &&
+        "state" in service && service.state === "ready"
+      )) break;
       if (batch.exitCode !== null) throw new Error(`Batch exited: ${batch.exitCode}`);
-      if (Date.now() > deadline) throw new Error("Batch did not register within 5s");
+      if (Date.now() > deadline) throw new Error("Batch did not become ready within 5s");
       await Bun.sleep(25);
     }
     return {
@@ -96,6 +105,7 @@ export async function startLocal(profile = "debug") {
       host,
       kernel,
       batch,
+      clientPath,
       async close() {
         try {
           await host!.close();

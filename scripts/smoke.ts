@@ -2,7 +2,6 @@ import assert from "node:assert/strict";
 import { LogsClient, logsContract } from "../examples/generated/logs";
 import { RuntimeHost } from "@lenso/runtime-sdk";
 import { startLocal } from "./local";
-import { resolve } from "node:path";
 
 const runtime = await startLocal();
 let tsService: RuntimeHost | undefined;
@@ -24,8 +23,35 @@ async function expectCode(run: () => Promise<unknown>, code: string) {
   throw new Error(`Expected ${code}`);
 }
 try {
-  const rust = Bun.spawn([resolve(import.meta.dir, "../target/debug/logs-client")], {
-    env: { ...process.env, LENSO_RUNTIME_PORT: String(runtime.port) },
+  tsService = await RuntimeHost.connect({
+    namespace: "demo",
+    service: "ts-logs",
+    instance: "ts-one",
+    port: runtime.port,
+    contract: logsContract,
+    handlers: {
+      aggregate: async (input) => {
+        const records = (input as { logs: typeof logs }).logs;
+        return {
+          count: records.length,
+          error_count: records.filter((record) => record.level === "error").length,
+          total_duration_ms: records.reduce((sum, record) => sum + record.duration_ms, 0),
+        };
+      },
+      progress: async function* (input) {
+        const records = (input as { logs: typeof logs }).logs;
+        for (let index = 0; index < records.length; index++) {
+          yield { processed: index + 1, total: records.length };
+        }
+      },
+    },
+  });
+  const rust = Bun.spawn([runtime.clientPath], {
+    env: {
+      ...process.env,
+      LENSO_RUNTIME_PORT: String(runtime.port),
+      LENSO_RUNTIME_SERVICE: "ts-logs",
+    },
     stdout: "pipe",
     stderr: "inherit",
   });
@@ -41,6 +67,9 @@ try {
       await rust.exited;
     }
   }
+  await tsService.drain(100);
+  await tsService.close();
+  tsService = undefined;
   assert.deepEqual(await client.aggregate({ logs }), {
     count: 2,
     error_count: 1,
@@ -191,6 +220,7 @@ try {
       smoke: "pass",
       checks: [
         "TS→kernel→Rust",
+        "Rust→kernel→TS",
         "Rust generated client",
         "generated clients",
         "stream",
