@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { loadavg } from "node:os";
 import { LogsClient } from "../generated/logs";
 import type { RuntimeHost } from "@lenso/runtime-sdk";
+import { methodology, warmCondition } from "../../scripts/benchmark-evidence";
 
 export const requests = Number(process.env.TRANSPORT_REQUESTS ?? 300);
 export const warmup = 50;
@@ -33,9 +34,10 @@ export async function measure(host: RuntimeHost, startup_ms: number) {
     const first = performance.now();
     assert.deepEqual(await client.aggregate({ logs }), expected);
     const first_call_ms = performance.now() - first;
-    for (let i = 0; i < warmup; i++)
-      assert.deepEqual(await client.aggregate({ logs }), expected);
     for (const concurrency of [1, concurrent]) {
+      await warmCondition(warmup, concurrency, async () => {
+        assert.deepEqual(await client.aggregate({ logs }), expected);
+      });
       const raw_ms: number[] = [];
       const failures: string[] = [];
       const load_before = loadavg();
@@ -84,6 +86,8 @@ export async function measure(host: RuntimeHost, startup_ms: number) {
   const eof_ms = performance.now() - start;
   assert.equal(arrivals_ms.length, 1000);
   return {
+    methodology_version: methodology, validation: "enabled",
+    latency_scope: "Excludes only this request's trailing assertion; other requests' assertions share the JS event loop. Throughput includes validation.",
     startup_ms, conditions, load_average_before, load_average_after: loadavg(),
     stream: { records: 1000, first_chunk_ms, completion_ms, eof_ms, arrivals_ms },
   };

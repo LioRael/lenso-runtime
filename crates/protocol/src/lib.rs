@@ -6,6 +6,12 @@ pub const MAX_FRAME_BYTES: usize = 256 * 1024;
 const SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
 const MAX_DEPTH: usize = 64;
 
+#[cfg(test)]
+std::thread_local! {
+    static SCHEMA_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static PAYLOAD_CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// A safe validation diagnostic, without the rejected payload.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[error("{0}")]
@@ -57,6 +63,27 @@ pub fn json_equivalent(left: &Value, right: &Value) -> bool {
 /// # Errors
 /// Returns a safe diagnostic for unsupported keywords, invalid shapes or bounds.
 pub fn validate_contract(contract: &Value) -> Result<(), ValidationError> {
+    visit_contract(contract, |_, method| {
+        for field in ["input", "output", "error"] {
+            schema(method_schema(method, field)?, 0)?;
+        }
+        Ok(())
+    })
+}
+
+fn method_schema<'a>(
+    method: &'a Map<String, Value>,
+    field: &str,
+) -> Result<&'a Value, ValidationError> {
+    method
+        .get(field)
+        .ok_or_else(|| ValidationError("missing method schema".into()))
+}
+
+fn visit_contract(
+    contract: &Value,
+    mut visit: impl FnMut(&str, &Map<String, Value>) -> Result<(), ValidationError>,
+) -> Result<(), ValidationError> {
     let obj = object(contract)?;
     keys(obj, &["version", "methods"])?;
     if !text(obj.get("version")) {
@@ -81,19 +108,90 @@ pub fn validate_contract(contract: &Value) -> Result<(), ValidationError> {
         ) {
             return fail("invalid method mode");
         }
-        for field in ["input", "output", "error"] {
-            schema(
-                method
-                    .get(field)
-                    .ok_or_else(|| ValidationError("missing method schema".into()))?,
-                0,
-            )?;
-        }
+        visit(name, method)?;
     }
     Ok(())
 }
 
+/// An immutable owned contract, retaining original JSON and shared method schemas.
+pub struct PreparedContract {
+    original: Value,
+    methods: std::collections::HashMap<String, std::sync::Arc<PreparedMethod>>,
+}
+
+/// Validated schemas for one immutable registered method.
+pub struct PreparedMethod {
+    stream: bool,
+    input: std::sync::Arc<PreparedSchema>,
+    output: std::sync::Arc<PreparedSchema>,
+    error: std::sync::Arc<PreparedSchema>,
+}
+
+impl PreparedContract {
+    /// Validate each schema once and retain the original JSON for compatibility.
+    ///
+    /// # Errors
+    /// Returns the same structural diagnostic as [`validate_contract`].
+    pub fn new(original: &Value) -> Result<Self, ValidationError> {
+        let mut methods = std::collections::HashMap::new();
+        visit_contract(original, |name, method| {
+            let input = PreparedSchema::new(method_schema(method, "input")?)?;
+            let output = PreparedSchema::new(method_schema(method, "output")?)?;
+            let error = PreparedSchema::new(method_schema(method, "error")?)?;
+            methods.insert(
+                name.to_owned(),
+                std::sync::Arc::new(PreparedMethod {
+                    stream: method["mode"] == "stream",
+                    input: std::sync::Arc::new(input),
+                    output: std::sync::Arc::new(output),
+                    error: std::sync::Arc::new(error),
+                }),
+            );
+            Ok(())
+        })?;
+        Ok(Self {
+            original: original.clone(),
+            methods,
+        })
+    }
+
+    /// Borrow the validated original contract without changing numeric tokens.
+    pub fn original(&self) -> &Value {
+        &self.original
+    }
+
+    /// Borrow a shared immutable method handle.
+    pub fn method(&self, name: &str) -> Option<&std::sync::Arc<PreparedMethod>> {
+        self.methods.get(name)
+    }
+}
+
+impl PreparedMethod {
+    /// Whether this method produces a stream rather than a unary result.
+    pub fn is_stream(&self) -> bool {
+        self.stream
+    }
+
+    /// The shared input schema.
+    pub fn input(&self) -> &std::sync::Arc<PreparedSchema> {
+        &self.input
+    }
+
+    /// The shared output schema.
+    pub fn output(&self) -> &std::sync::Arc<PreparedSchema> {
+        &self.output
+    }
+
+    /// The shared business-error schema.
+    pub fn error(&self) -> &std::sync::Arc<PreparedSchema> {
+        &self.error
+    }
+}
+
 fn schema(value: &Value, depth: usize) -> Result<(), ValidationError> {
+    #[cfg(test)]
+    SCHEMA_VISITS.with(|visits| visits.set(visits.get() + 1));
+
     if depth > MAX_DEPTH {
         return fail("schema too deep");
     }
@@ -266,6 +364,38 @@ fn schema(value: &Value, depth: usize) -> Result<(), ValidationError> {
     Ok(())
 }
 
+/// An owned v1 schema snapshot whose complete structure has been validated.
+///
+/// Preparation does not change [`validate_value`]'s defensive raw-schema behavior.
+/// Later changes to the original schema cannot affect this snapshot. Every call to
+/// [`Self::validate_value`] still checks the payload, but skips structural validation.
+pub struct PreparedSchema {
+    schema: Value,
+}
+
+impl PreparedSchema {
+    /// Validate and copy a raw schema into an immutable snapshot.
+    ///
+    /// # Errors
+    /// Returns the same safe structural diagnostic as raw schema validation.
+    pub fn new(schema_value: &Value) -> Result<Self, ValidationError> {
+        schema(schema_value, 0)?;
+        Ok(Self {
+            schema: schema_value.clone(),
+        })
+    }
+
+    /// Validate a payload without coercion against the prepared snapshot.
+    ///
+    /// # Errors
+    /// Returns the same safe payload diagnostic as [`validate_value`].
+    pub fn validate_value(&self, value: &Value) -> Result<(), ValidationError> {
+        #[cfg(test)]
+        PAYLOAD_CHECKS.with(|checks| checks.set(checks.get() + 1));
+        check(&self.schema, value, 0)
+    }
+}
+
 /// Validate a JSON value without coercion, including safe-integer and closed-object rules.
 ///
 /// # Errors
@@ -348,7 +478,17 @@ fn check(schema: &Value, value: &Value, depth: usize) -> Result<(), ValidationEr
         }
     }
     if let Some(text) = value.as_str() {
-        size(schema, text.chars().count(), "minLength", "maxLength")?;
+        if schema.get("minLength").is_some() || schema.get("maxLength").is_some() {
+            let max = schema.get("maxLength").and_then(Value::as_u64);
+            let mut count = 0;
+            for _ in text.chars() {
+                count += 1;
+                if max.is_some_and(|max| count as u64 > max) {
+                    return fail("size outside bounds");
+                }
+            }
+            size(schema, count, "minLength", "maxLength")?;
+        }
     }
     if let Some(number) = value.as_f64() {
         if schema
@@ -464,6 +604,9 @@ pub fn validate_host_frame(value: &Value) -> Result<(), ValidationError> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod prepared_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1,73 +1,47 @@
 import { execFileSync } from "node:child_process";
-import { createHash } from "node:crypto";
-import { resolve, relative, isAbsolute } from "node:path";
-import { cpus, platform, release, arch, loadavg } from "node:os";
 import { measure } from "../examples/multitransport/measure";
-import { startTransport, type TargetTransport } from "../examples/multitransport/local";
+import { root, startTransport, type TargetTransport } from "../examples/multitransport/local";
+import { balancedOrders, benchmarkEnvironment, containedPath, provenance, rejectDrift, repeatCount, writeEvidence, sha256 } from "./benchmark-evidence";
 
-if (process.argv.includes("--baseline"))
-  throw new Error("Never overwrite the preserved pre-refactor baseline with a new kernel.");
-const output = process.argv.indexOf("--output");
-const path = output < 0 ? undefined : process.argv[output + 1];
-if (output >= 0) {
-  const local = path && relative(resolve("examples/multitransport"), resolve(path));
-  if (!path || !local || local.startsWith("..") || isAbsolute(local) ||
-    !path.endsWith(".json") || local === "baseline.json")
-    throw new Error("--output must name a non-baseline JSON file in examples/multitransport/");
+function option(name: string) {
+  const index = process.argv.indexOf(name);
+  if (index < 0) return undefined;
+  const value = process.argv[index + 1];
+  if (!value || value.startsWith("--")) throw new Error(`Missing value for ${name}`);
+  return value;
 }
-const previous = path && await Bun.file(path).exists() ? await Bun.file(path).json() : undefined;
-const baseline = await Bun.file("examples/multitransport/baseline.json").json();
-const results: Record<string, Awaited<ReturnType<typeof measure>>> = {};
-const select = process.argv.indexOf("--transport");
-const transports = select < 0 ? ["tcp", "stdio", "websocket"] : [process.argv[select + 1]];
-if (transports.some(value => !["tcp", "stdio", "websocket"].includes(value ?? "")))
-  throw new Error("--transport must be tcp, stdio or websocket");
-for (const transport of transports as TargetTransport[]) {
-  const runtime = await startTransport(transport);
-  try { results[transport] = await measure(runtime.host, runtime.startup_ms); }
-  finally { await runtime.close(); }
+if (process.argv.includes("--baseline")) throw new Error("The historical baseline is protected");
+const output = option("--output");
+if (output) containedPath(`${root}/examples/multitransport`, output);
+const selected = option("--transport");
+if (selected && !["tcp", "stdio", "websocket"].includes(selected)) throw new Error("Unknown transport");
+const transports: TargetTransport[] = selected ? [selected as TargetTransport] : ["tcp", "stdio", "websocket"];
+const count = repeatCount(option("--repeat"));
+const before = await provenance(root);
+const environment = benchmarkEnvironment();
+const runs = [];
+for (const [round, order] of balancedOrders(transports, count).entries()) {
+  for (const transport of order) {
+    const runtime = await startTransport(transport);
+    try {
+      runs.push({ round, transport, config_sha256: runtime.config_sha256, launch_config: runtime.launch_config, ...await measure(runtime.host, runtime.startup_ms) });
+      await runtime.verifyConfig();
+    }
+    finally { await runtime.close(); }
+  }
 }
-const comparisons = Object.fromEntries(Object.entries(results).map(([transport, result]) => [
-  transport, result.conditions.map(condition => {
-    const old = baseline.old_tcp.conditions.find((c: typeof condition) =>
-      c.records === condition.records && c.concurrency === condition.concurrency);
-    return {
-      records: condition.records, concurrency: condition.concurrency,
-      requests_match: old.requests === condition.requests,
-      baseline_requests: old.requests,
-      throughput_ratio: condition.throughput_per_second / old.throughput_per_second,
-      p50_ratio: condition.latency_ms.p50! / old.latency_ms.p50,
-      p95_ratio: condition.latency_ms.p95! / old.latency_ms.p95,
-      p99_ratio: condition.latency_ms.p99! / old.latency_ms.p99,
-      errors: condition.errors, baseline_errors: old.errors,
-    };
-  }),
-]));
-const result = {
+rejectDrift(before, await provenance(root));
+const manifestIdentity = (files: Record<string, string>) => ({
+  sha256: sha256(Buffer.from(JSON.stringify(files))), files: Object.keys(files).length,
+});
+const report = {
   captured_at: new Date().toISOString(),
-  revision: execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim(),
-  working_tree_modified: execFileSync("git", ["status", "--porcelain"], { encoding: "utf8" }).trim().length > 0,
-  source_hashes: Object.fromEntries(await Promise.all([
-    "Cargo.lock", "bun.lock", "crates/kernel/src/lib.rs", "crates/kernel/src/process.rs",
-    "crates/transport/src/lib.rs", "crates/transport/src/stdio.rs", "crates/transport/src/diagnostics.rs",
-    "crates/sdk/src/lib.rs", "sdk/typescript/index.ts", "sdk/typescript/package.json",
-    "sdk/typescript/transport.ts", "sdk/typescript/websocket.ts", "examples/batch/src/main.rs",
-    "examples/multitransport/measure.ts",
-  ].map(async path => [path, createHash("sha256").update(Buffer.from(await Bun.file(path).arrayBuffer())).digest("hex")]))),
-  environment: {
-    platform: platform(), os: release(), arch: arch(), cpu: cpus()[0]?.model,
-    bun: Bun.version,
-    rustc: execFileSync("rustc", ["--version"], { encoding: "utf8" }).trim(),
-    build: "release", caller_transport: "tcp",
-    logical_cpus: cpus().length, load_average_after: loadavg(), machine_isolated: false,
-    validation: baseline.environment.validation,
-    logging: baseline.environment.logging,
-  },
-  results, comparisons,
-  previous_unisolated_run: previous?.previous_unisolated_run ?? previous,
-  note: "Caller is always TCP; target alone varies. Same release Rust logs-batch handler, generated client, payloads, validation and logging as baseline. Raw local samples, not iii/legacy comparisons. Latency excludes assertions; throughput includes them. Startup includes owned-process config creation, kernel/service launch, caller handshake and readiness polling, unlike baseline's separate service spawn. Final expected chunk and EOF are separate. First call per payload is outside warmed samples; larger-payload first call is not a cold process. Single local runs do not establish general transport superiority.",
+  revision: execFileSync("git", ["rev-parse", "HEAD"], { cwd: root, encoding: "utf8" }).trim(),
+  environment, environment_after: benchmarkEnvironment(),
+  provenance_identity: { source: manifestIdentity(before.source), application_source: manifestIdentity(before.application_source), harness: manifestIdentity(before.harness), binaries: before.binaries },
+  runs,
+  note: "Rotating target orders; independent warmup for every concurrency. Historical v1 baseline is a different methodology and is not used for v2 ratios. p99 remains descriptive. No superiority or production SLO claim.",
 };
-if (path) {
-  await Bun.write(path, JSON.stringify(result, null, 2) + "\n");
-}
+// Full manifests stay with the raw measurements; compact output carries their identities.
+const result = await writeEvidence(root, { ...report, manifests: before }, output);
 console.log(JSON.stringify(result, null, 2));

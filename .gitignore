@@ -2,3 +2,4 @@
 node_modules/
 /sdk/typescript/dist/
 /.native-check/
+/.perf-artifacts/

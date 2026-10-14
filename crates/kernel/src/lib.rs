@@ -1,9 +1,8 @@
 //! Bounded loopback routing kernel. Only the routing actor mutates lifecycle and calls.
-use protocol::{
-    json_equivalent, validate_contract, validate_host_frame, validate_value, MAX_FRAME_BYTES,
-};
+use protocol::{json_equivalent, validate_host_frame, MAX_FRAME_BYTES};
+use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
@@ -31,7 +30,7 @@ enum Event {
     Gone(u64),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 struct Identity {
     namespace: String,
     service: String,
@@ -44,7 +43,7 @@ struct Host {
     transport: &'static str,
     expected: Option<Identity>,
     identity: Option<Identity>,
-    contract: Option<Arc<Value>>,
+    contract: Option<Arc<protocol::PreparedContract>>,
     concurrency: usize,
     ready: bool,
     drain: Option<Instant>,
@@ -56,7 +55,7 @@ struct Host {
 
 struct Selection {
     generation: u64,
-    contract: Arc<Value>,
+    contract: Arc<protocol::PreparedContract>,
 }
 
 struct Reservation {
@@ -72,8 +71,8 @@ struct Call {
     service: String,
     version: String,
     method: String,
-    contract: Arc<Value>,
-    definition: Value,
+    contract: Arc<protocol::PreparedContract>,
+    definition: Arc<protocol::PreparedMethod>,
     input: Value,
     trace: String,
     parent: Option<String>,
@@ -82,6 +81,76 @@ struct Call {
     deadline: Instant,
     callee: Option<u64>,
     credits: u64,
+}
+
+#[derive(Serialize)]
+struct Invocation<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    id: String,
+    method: &'a str,
+    input: &'a Value,
+    timeout_ms: u128,
+    trace_id: &'a str,
+    caller: &'a Identity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_id: Option<&'a str>,
+}
+
+struct EncodedFrame(Vec<u8>);
+
+fn encode(frame: &impl Serialize) -> Option<EncodedFrame> {
+    let mut bytes = serde_json::to_vec(frame).ok()?;
+    bytes.push(b'\n');
+    (bytes.len() <= MAX_FRAME_BYTES).then_some(EncodedFrame(bytes))
+}
+
+struct Candidate {
+    generation: u64,
+    namespace: String,
+    service: String,
+    version: String,
+    concurrency: usize,
+    busy: usize,
+}
+
+#[cfg(test)]
+#[derive(Default, Clone, Copy)]
+struct SchedulingWork {
+    call_visits: usize,
+    host_visits: usize,
+    candidate_visits: usize,
+}
+
+struct SchedulingSnapshot {
+    active: usize,
+    waiting: Vec<u64>,
+    candidates: Vec<Candidate>,
+    #[cfg(test)]
+    work: SchedulingWork,
+}
+
+impl SchedulingSnapshot {
+    fn available(&mut self, namespace: &str, service: &str, version: &str) -> Option<usize> {
+        if self.active >= ACTIVE {
+            return None;
+        }
+        #[cfg(test)]
+        {
+            self.work.candidate_visits += self.candidates.len();
+        }
+        self.candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| {
+                h.namespace == namespace
+                    && h.service == service
+                    && h.version == version
+                    && h.busy < h.concurrency
+            })
+            .min_by_key(|(_, h)| (h.busy, h.generation))
+            .map(|(index, _)| index)
+    }
 }
 
 #[derive(Default)]
@@ -94,6 +163,8 @@ struct Actor {
     selections: BTreeMap<(String, String), Selection>,
     managed_identities: BTreeMap<(String, String, String), Reservation>,
     shutting_down: bool,
+    #[cfg(test)]
+    scheduling_work: SchedulingWork,
 }
 
 fn string(frame: &Value, key: &str) -> String {
@@ -102,19 +173,18 @@ fn string(frame: &Value, key: &str) -> String {
 
 impl Actor {
     fn send(&mut self, host: u64, frame: Value) {
-        let Ok(mut bytes) = serde_json::to_vec(&frame) else {
-            self.failed_writers.insert(host);
-            return;
-        };
-        bytes.push(b'\n');
-        if bytes.len() > MAX_FRAME_BYTES {
+        let Some(encoded) = encode(&frame) else {
             self.error(host, frame.get("id").and_then(Value::as_str), "overloaded");
             return;
-        }
+        };
+        self.enqueue(host, encoded);
+    }
+
+    fn enqueue(&mut self, host: u64, encoded: EncodedFrame) {
         if self
             .hosts
             .get(&host)
-            .is_some_and(|h| h.out.try_send(bytes).is_err())
+            .is_some_and(|h| h.out.try_send(encoded.0).is_err())
         {
             self.failed_writers.insert(host);
         }
@@ -140,27 +210,61 @@ impl Actor {
             .count()
     }
 
-    fn available(&self, namespace: &str, service: &str, version: &str) -> Option<u64> {
-        if self.calls.values().filter(|c| c.callee.is_some()).count() >= ACTIVE {
-            return None;
+    fn scheduling_snapshot(&self) -> SchedulingSnapshot {
+        let mut snapshot = SchedulingSnapshot {
+            active: 0,
+            waiting: Vec::new(),
+            candidates: Vec::new(),
+            #[cfg(test)]
+            work: SchedulingWork::default(),
+        };
+        let mut busy = HashMap::<u64, usize>::new();
+        for (route, call) in &self.calls {
+            #[cfg(test)]
+            {
+                snapshot.work.call_visits += 1;
+            }
+            if let Some(callee) = call.callee {
+                snapshot.active += 1;
+                *busy.entry(callee).or_default() += 1;
+            } else {
+                snapshot.waiting.push(*route);
+            }
         }
-        let selected = self
-            .selections
-            .get(&(namespace.to_owned(), service.to_owned()));
-        self.hosts
-            .iter()
-            .filter(|(id, h)| {
-                selected.is_none_or(|s| s.generation == **id)
-                    && h.ready
-                    && h.drain.is_none()
-                    && h.identity
-                        .as_ref()
-                        .is_some_and(|i| i.namespace == namespace && i.service == service)
-                    && h.contract.as_ref().is_some_and(|c| c["version"] == version)
-            })
-            .filter(|(id, h)| self.busy(**id) < h.concurrency)
-            .min_by_key(|(id, _)| (self.busy(**id), **id))
-            .map(|(id, _)| *id)
+        for (generation, host) in &self.hosts {
+            #[cfg(test)]
+            {
+                snapshot.work.host_visits += 1;
+            }
+            let (Some(identity), Some(contract)) = (&host.identity, &host.contract) else {
+                continue;
+            };
+            let selected = self
+                .selections
+                .get(&(identity.namespace.clone(), identity.service.clone()));
+            if !host.ready
+                || host.drain.is_some()
+                || selected.is_some_and(|s| s.generation != *generation)
+            {
+                continue;
+            }
+            snapshot.candidates.push(Candidate {
+                generation: *generation,
+                namespace: identity.namespace.clone(),
+                service: identity.service.clone(),
+                version: string(contract.original(), "version"),
+                concurrency: host.concurrency,
+                busy: busy.get(generation).copied().unwrap_or(0),
+            });
+        }
+        snapshot
+    }
+
+    fn available(&self, namespace: &str, service: &str, version: &str) -> Option<u64> {
+        let mut snapshot = self.scheduling_snapshot();
+        snapshot
+            .available(namespace, service, version)
+            .map(|index| snapshot.candidates[index].generation)
     }
 
     fn request_id(&mut self, host: u64, frame: &Value) -> bool {
@@ -184,6 +288,14 @@ impl Actor {
     }
 
     fn terminal(&mut self, route: u64, frame: Value, cancel: bool) {
+        if let Some(call) = self.retire(route, &frame, cancel) {
+            let mut frame = frame;
+            frame["id"] = json!(call.client_id);
+            self.send(call.caller, frame);
+        }
+    }
+
+    fn retire(&mut self, route: u64, frame: &Value, cancel: bool) -> Option<Call> {
         if let Some(call) = self.calls.remove(&route) {
             if self.recent.len() == 64 {
                 self.recent.pop_front();
@@ -202,9 +314,9 @@ impl Actor {
                     self.send(callee, json!({"type":"cancel","id":route.to_string()}));
                 }
             }
-            let mut frame = frame;
-            frame["id"] = json!(call.client_id);
-            self.send(call.caller, frame);
+            Some(call)
+        } else {
+            None
         }
     }
 
@@ -289,14 +401,10 @@ impl Actor {
         if self.shutting_down {
             return;
         }
-        let waiting: Vec<_> = self
-            .calls
-            .iter()
-            .filter(|(_, c)| c.callee.is_none())
-            .map(|(id, _)| *id)
-            .collect();
+        let mut snapshot = self.scheduling_snapshot();
+        let waiting = std::mem::take(&mut snapshot.waiting);
         for route in waiting {
-            if self.calls.values().filter(|c| c.callee.is_some()).count() >= ACTIVE {
+            if snapshot.active >= ACTIVE {
                 break;
             }
             if self
@@ -310,9 +418,14 @@ impl Actor {
             let Some(call) = self.calls.get(&route) else {
                 continue;
             };
-            let callee = self.available(&call.namespace, &call.service, &call.version);
-            if let Some(callee) = callee {
+            let candidate = snapshot.available(&call.namespace, &call.service, &call.version);
+            if let Some(index) = candidate {
+                let callee = snapshot.candidates[index].generation;
                 let Some(invoke) = self.invocation(route, call) else {
+                    continue;
+                };
+                let Some(encoded) = encode(&invoke) else {
+                    self.fail(route, "invalid_input");
                     continue;
                 };
                 let credits = call.credits;
@@ -320,7 +433,11 @@ impl Actor {
                     call.callee = Some(callee);
                     call.assigned = Some(Instant::now());
                 }
-                self.send(callee, invoke);
+                // Only waiting calls can retire in this pass; writer disconnects
+                // remain in maintenance, so successful assignments only add occupancy.
+                snapshot.active += 1;
+                snapshot.candidates[index].busy += 1;
+                self.enqueue(callee, encoded);
                 if credits > 0 {
                     self.send(
                         callee,
@@ -329,20 +446,28 @@ impl Actor {
                 }
             }
         }
+        #[cfg(test)]
+        {
+            self.scheduling_work = snapshot.work;
+        }
     }
 
-    fn invocation(&self, route: u64, call: &Call) -> Option<Value> {
+    fn invocation<'a>(&'a self, route: u64, call: &'a Call) -> Option<Invocation<'a>> {
         let identity = self.hosts.get(&call.caller)?.identity.as_ref()?;
-        let mut invoke = json!({
-            "type":"invoke","id":route.to_string(),"method":call.method,"input":call.input,
-            "timeout_ms":call.deadline.saturating_duration_since(Instant::now()).as_millis().max(1),
-            "trace_id":call.trace,
-            "caller":{"namespace":identity.namespace,"service":identity.service,"instance":identity.instance}
-        });
-        if let Some(parent) = &call.parent {
-            invoke["parent_id"] = json!(parent);
-        }
-        Some(invoke)
+        Some(Invocation {
+            kind: "invoke",
+            id: route.to_string(),
+            method: &call.method,
+            input: &call.input,
+            timeout_ms: call
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .max(1),
+            trace_id: &call.trace,
+            caller: identity,
+            parent_id: call.parent.as_deref(),
+        })
     }
 
     fn frame(&mut self, host: u64, frame: Value) {
@@ -505,15 +630,15 @@ impl Actor {
                     .is_some_and(|i| i.namespace == namespace && i.service == service)
                 && h.contract
                     .as_ref()
-                    .is_some_and(|c| !json_equivalent(c, &contract))
+                    .is_some_and(|c| !json_equivalent(c.original(), contract.original()))
         }) || self.calls.values().any(|c| {
             c.namespace == namespace
                 && c.service == service
-                && !json_equivalent(&c.contract, &contract)
+                && !json_equivalent(c.contract.original(), contract.original())
         }) || self
             .selections
             .get(&key)
-            .is_some_and(|s| !json_equivalent(&s.contract, &contract));
+            .is_some_and(|s| !json_equivalent(s.contract.original(), contract.original()));
         if incompatible {
             self.error(operator, Some(&id), "contract_mismatch");
             return;
@@ -547,14 +672,14 @@ impl Actor {
     fn register(&mut self, host: u64, frame: &Value) {
         let h = &self.hosts[&host];
         let concurrency = frame["max_concurrency"].as_u64().unwrap_or(0);
-        if h.contract.is_some()
-            || h.drain.is_some()
-            || !(1..=64).contains(&concurrency)
-            || validate_contract(&frame["contract"]).is_err()
-        {
+        if h.contract.is_some() || h.drain.is_some() || !(1..=64).contains(&concurrency) {
             self.protocol_error(host);
             return;
         }
+        let Ok(contract) = protocol::PreparedContract::new(&frame["contract"]) else {
+            self.protocol_error(host);
+            return;
+        };
         let Some(identity) = &h.identity else {
             return;
         };
@@ -564,8 +689,8 @@ impl Actor {
                     i.namespace == identity.namespace && i.service == identity.service
                 })
                 && other.contract.as_ref().is_some_and(|c| {
-                    c["version"] == frame["contract"]["version"]
-                        && !json_equivalent(c, &frame["contract"])
+                    c.original()["version"] == frame["contract"]["version"]
+                        && !json_equivalent(c.original(), &frame["contract"])
                 })
         });
         // Queued calls retain the admitted contract even after all old instances leave.
@@ -574,14 +699,14 @@ impl Actor {
                 c.namespace == identity.namespace
                     && c.service == identity.service
                     && c.version == frame["contract"]["version"]
-                    && !json_equivalent(&c.contract, &frame["contract"])
+                    && !json_equivalent(c.contract.original(), &frame["contract"])
             })
             || self
                 .selections
                 .get(&(identity.namespace.clone(), identity.service.clone()))
                 .is_some_and(|s| {
-                    s.contract["version"] == frame["contract"]["version"]
-                        && !json_equivalent(&s.contract, &frame["contract"])
+                    s.contract.original()["version"] == frame["contract"]["version"]
+                        && !json_equivalent(s.contract.original(), &frame["contract"])
                 });
         if conflict {
             self.error(host, None, "contract_mismatch");
@@ -589,13 +714,13 @@ impl Actor {
             return;
         }
         if let Some(h) = self.hosts.get_mut(&host) {
-            h.contract = Some(Arc::new(frame["contract"].clone()));
+            h.contract = Some(Arc::new(contract));
             h.concurrency = concurrency as usize;
         }
         self.send(host, json!({"type":"registered"}));
     }
 
-    fn admit(&mut self, host: u64, frame: Value) {
+    fn admit(&mut self, host: u64, mut frame: Value) {
         let id = string(&frame, "id");
         if !self.request_id(host, &frame) {
             return;
@@ -617,9 +742,11 @@ impl Actor {
                     .is_some_and(|i| i.namespace == namespace && i.service == service)
             })
             .collect();
-        let contract = matching
-            .iter()
-            .find_map(|h| h.contract.as_ref().filter(|c| c["version"] == version));
+        let contract = matching.iter().find_map(|h| {
+            h.contract
+                .as_ref()
+                .filter(|c| c.original()["version"] == version)
+        });
         let Some(contract) = contract else {
             let code = if matching.is_empty() {
                 "service_not_found"
@@ -632,11 +759,10 @@ impl Actor {
             return;
         };
         let contract = Arc::clone(contract);
-        let definition = contract["methods"][&method].clone();
-        if definition.is_null() {
+        let Some(definition) = contract.method(&method).cloned() else {
             self.error(host, Some(&id), "contract_mismatch");
             return;
-        }
+        };
         let selected = self.selections.get(&(namespace.clone(), service.clone()));
         if !self.hosts.iter().any(|(generation, h)| {
             selected.is_none_or(|s| s.generation == *generation)
@@ -645,12 +771,14 @@ impl Actor {
                     .is_some_and(|i| i.namespace == namespace && i.service == service)
                 && h.ready
                 && h.drain.is_none()
-                && h.contract.as_ref().is_some_and(|c| c["version"] == version)
+                && h.contract
+                    .as_ref()
+                    .is_some_and(|c| c.original()["version"] == version)
         }) {
             self.error(host, Some(&id), "not_ready");
             return;
         }
-        if validate_value(&definition["input"], &frame["input"]).is_err() {
+        if definition.input().validate_value(&frame["input"]).is_err() {
             self.error(host, Some(&id), "invalid_input");
             return;
         }
@@ -680,7 +808,7 @@ impl Actor {
             method,
             contract,
             definition,
-            input: frame["input"].clone(),
+            input: frame["input"].take(),
             trace: frame
                 .get("trace_id")
                 .and_then(Value::as_str)
@@ -696,10 +824,12 @@ impl Actor {
             callee: None,
             credits: 0,
         };
+        // Admission must reject envelope overflow even while capacity is busy.
+        // Dispatch re-encodes borrowed input with the then-current remaining deadline.
         let fits = self
             .invocation(route, &call)
-            .and_then(|invoke| serde_json::to_vec(&invoke).ok())
-            .is_some_and(|bytes| bytes.len() < MAX_FRAME_BYTES);
+            .and_then(|invoke| encode(&invoke))
+            .is_some();
         if !fits {
             self.error(host, Some(&call.client_id), "invalid_input");
             return;
@@ -708,7 +838,7 @@ impl Actor {
         self.schedule();
     }
 
-    fn response(&mut self, host: u64, frame: Value) {
+    fn response(&mut self, host: u64, mut frame: Value) {
         let id = string(&frame, "id");
         let route = id.parse::<u64>().ok().filter(|r| r.to_string() == id);
         let Some(route) = route else {
@@ -728,24 +858,33 @@ impl Actor {
             return;
         }
         let kind = frame["type"].as_str().unwrap_or("");
-        let stream = call.definition["mode"] == "stream";
+        let stream = call.definition.is_stream();
         let valid = match kind {
             "result" => {
-                !stream && validate_value(&call.definition["output"], &frame["output"]).is_ok()
+                !stream
+                    && call
+                        .definition
+                        .output()
+                        .validate_value(&frame["output"])
+                        .is_ok()
             }
             "chunk" => {
                 stream
                     && call.credits > 0
-                    && validate_value(&call.definition["output"], &frame["output"]).is_ok()
+                    && call
+                        .definition
+                        .output()
+                        .validate_value(&frame["output"])
+                        .is_ok()
             }
             "end" => stream,
             "error" => {
                 frame["code"] != "business"
-                    || validate_value(
-                        &call.definition["error"],
-                        frame.get("details").unwrap_or(&Value::Null),
-                    )
-                    .is_ok()
+                    || call
+                        .definition
+                        .error()
+                        .validate_value(frame.get("details").unwrap_or(&Value::Null))
+                        .is_ok()
             }
             _ => false,
         };
@@ -758,34 +897,38 @@ impl Actor {
             self.fail(route, code);
             return;
         }
-        let mut forwarded = frame.clone();
-        forwarded["id"] = json!(call.client_id);
-        if serde_json::to_vec(&forwarded).map_or(true, |bytes| bytes.len() >= MAX_FRAME_BYTES) {
+        let chunk = kind == "chunk";
+        let infrastructure_error = kind == "error" && frame["code"] != "business";
+        let caller = call.caller;
+        frame["id"] = json!(call.client_id);
+        if infrastructure_error {
+            // Preserve overflow rejection of the original expanded envelope, even
+            // though infrastructure diagnostics are removed before transmission.
+            if encode(&frame).is_none() {
+                self.fail(route, "invalid_output");
+                return;
+            }
+            frame = json!({"type":"error","id":frame["id"],
+                "code":frame["code"],"message":frame["code"]});
+        }
+        let Some(encoded) = encode(&frame) else {
             self.fail(route, "invalid_output");
             return;
-        }
-        if kind == "chunk" {
-            let caller = call.caller;
-            let client_id = call.client_id.clone();
+        };
+        if chunk {
             if let Some(call) = self.calls.get_mut(&route) {
                 call.credits -= 1;
             }
-            let mut frame = frame;
-            frame["id"] = json!(client_id);
-            self.send(caller, frame);
         } else {
-            // Infrastructure diagnostics cannot leak host exception text or payload details.
-            let safe = if kind == "error" && frame["code"] != "business" {
-                json!({"type":"error","code":frame["code"],"message":frame["code"]})
-            } else {
-                frame
-            };
-            self.terminal(route, safe, false);
+            self.retire(route, &frame, false);
         }
+        self.enqueue(caller, encoded);
     }
 
     fn control(&mut self, host: u64, frame: Value) {
         let id = string(&frame, "id");
+        // Derive from the bounded live calls (at most ACTIVE + WAITING), so
+        // terminal cleanup cannot leave a stale caller-generation lookup.
         let route = self
             .calls
             .iter()
@@ -800,7 +943,7 @@ impl Actor {
         }
         let call = &self.calls[&route];
         let credits = frame["credits"].as_u64().unwrap_or(0);
-        if call.definition["mode"] != "stream"
+        if !call.definition.is_stream()
             || credits == 0
             || credits > 16
             || call.credits + credits > 16
@@ -823,9 +966,9 @@ impl Actor {
     fn status(&mut self, host: u64, frame: &Value) {
         let services: Vec<_> = self.hosts.iter().filter_map(|(id, h)| h.identity.as_ref().map(|i| json!({
             "namespace":i.namespace,"service":i.service,"instance":i.instance,"generation":id.to_string(),"transport":h.transport,
-            "contract_version":h.contract.as_ref().map(|c| &c["version"]),
+            "contract_version":h.contract.as_ref().map(|c| &c.original()["version"]),
             "selected":self.selections.get(&(i.namespace.clone(), i.service.clone())).is_some_and(|s| s.generation == *id),
-            "capabilities":h.contract.as_ref().and_then(|c| c["methods"].as_object()).map(|methods|
+            "capabilities":h.contract.as_ref().and_then(|c| c.original()["methods"].as_object()).map(|methods|
                 methods.iter().map(|(name, definition)| json!({"method":name,"mode":definition["mode"]})).collect::<Vec<_>>()).unwrap_or_default(),
             "state":if h.drained {"drained"} else if h.drain.is_some() {"draining"} else if h.ready {"ready"} else if h.contract.is_some() {"registered"} else {"connected"},
             "active_calls":self.busy(*id),"max_concurrency":h.concurrency

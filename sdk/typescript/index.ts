@@ -1,6 +1,7 @@
 import { connectTransport, MAX_PAYLOAD, type Transport, type TransportOptions } from "./transport";
 import { types } from "node:util";
 import { type Contract, validateContract, validateSchema, validateValue } from "./schema";
+import { waitForOperation } from "./cancellation";
 export { type Contract, type Schema } from "./schema";
 export class RuntimeError<E = unknown> extends Error {
   constructor(
@@ -432,6 +433,8 @@ export class RuntimeHost {
         if (typeof frame.id !== "string") throw error("protocol_error");
         const p = this.pending.get(frame.id);
         if (!p) return;
+        // Keep the captured method reference live: replacing its fields or
+        // mutating nested schemas remains observable throughout a stream.
         const schema =
           frame.type === "error" && frame.code === "business"
             ? p.contract?.error
@@ -668,6 +671,8 @@ export class RuntimeHost {
     };
   }
   private async invoke(frame: Frame): Promise<void> {
+    // Capture the method object, not a schema snapshot. Later map replacement
+    // affects new invocations; mutation of this object affects this invocation.
     const method = this.options.contract.methods[frame.method],
       handler = this.options.handlers?.[frame.method];
     if (!this.accepting || this.executions >= (this.options.maxConcurrency ?? 8)) {
@@ -686,11 +691,6 @@ export class RuntimeHost {
       invocation.wake?.();
     }, frame.timeout_ms);
     const signal = invocation.controller.signal;
-    const aborted = deferred<never>();
-    const onAbort = () => aborted.reject(signal.reason);
-    signal.addEventListener("abort", onAbort, { once: true });
-    // A handler may ignore cancellation; race it so transport resources still terminate.
-    const race = <T>(promise: Promise<T>) => Promise.race([promise, aborted.promise]);
     let iterator: AsyncIterator<unknown> | undefined;
     let handlerWork: Promise<unknown> | undefined;
     let localWork: Promise<unknown> = Promise.resolve();
@@ -711,7 +711,7 @@ export class RuntimeHost {
         }),
       );
       localWork = handlerWork;
-      const output = await race(handlerWork);
+      const output = await waitForOperation(handlerWork, signal);
       if (method.mode === "unary") {
         try {
           validateWireValue(output);
@@ -730,16 +730,17 @@ export class RuntimeHost {
         while (true) {
           if (signal.aborted) throw signal.reason;
           if (!invocation.credits)
-            await race(
+            await waitForOperation(
               new Promise<void>((resolve) => {
                 invocation.wake = resolve;
               }),
+              signal,
             );
           invocation.wake = undefined;
           if (signal.aborted) throw signal.reason;
           const next = Promise.resolve(iterator.next());
           localWork = next;
-          const item = await race(next);
+          const item = await waitForOperation(next, signal);
           if (item.done) {
             this.send({ type: "end", id: frame.id });
             break;
@@ -775,7 +776,7 @@ export class RuntimeHost {
       }
     } finally {
       clearTimeout(timer);
-      signal.removeEventListener("abort", onAbort);
+      invocation.wake = undefined;
       this.invocations.delete(frame.id);
       // Transport cancellation cannot release the permit of a still-running JS Promise.
       const cleanup = Promise.resolve().then(async () => {

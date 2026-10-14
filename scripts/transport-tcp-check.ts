@@ -1,18 +1,26 @@
 import assert from "node:assert/strict";
-import { createHash } from "node:crypto";
 import { resolve } from "node:path";
 import { RuntimeHost } from "@lenso/runtime-sdk";
 import { emptyContract, reservePort, stopProcess } from "./local";
 import { measure } from "../examples/multitransport/measure";
 import { root, startTransport } from "../examples/multitransport/local";
+import { balancedOrders, benchmarkEnvironment, containedPath, loadReferenceRuntimeHost, pairedRatios, provenance, referenceRevision, rejectDrift, repeatCount, sha256, verifyReferenceSource, writeEvidence, type Json } from "./benchmark-evidence";
 
 const baseline = await Bun.file(resolve(root, "examples/multitransport/baseline.json")).json();
 const referenceRoot = resolve(root, "target/tcp-before-source");
-for (const [path, hash] of Object.entries(baseline.source_sha256)) {
-  const bytes = Buffer.from(await Bun.file(resolve(referenceRoot, path)).arrayBuffer());
-  assert.equal(createHash("sha256").update(bytes).digest("hex"), hash, `Original source mismatch: ${path}`);
-}
-const original: { RuntimeHost: typeof RuntimeHost } = await import(resolve(referenceRoot, "sdk/typescript/index.ts"));
+const outputIndex = process.argv.indexOf("--output");
+const output = outputIndex < 0 ? undefined : process.argv[outputIndex + 1];
+if (outputIndex >= 0 && !output) throw new Error("Missing --output path");
+if (output) containedPath(resolve(root, "examples/multitransport"), output);
+if (process.argv.includes("--baseline")) throw new Error("The historical baseline is protected");
+const repeatIndex = process.argv.indexOf("--repeat");
+if (repeatIndex >= 0 && !process.argv[repeatIndex + 1]) throw new Error("Missing --repeat count");
+const count = repeatCount(repeatIndex < 0 ? undefined : process.argv[repeatIndex + 1]);
+const revision = referenceRevision(process.argv, baseline.revision);
+const reference = await verifyReferenceSource(root, referenceRoot, revision, baseline);
+const before = { current: await provenance(root), original: await provenance(referenceRoot, root) };
+const environment = benchmarkEnvironment();
+const original = await loadReferenceRuntimeHost(referenceRoot);
 
 async function startReference() {
   const started = performance.now(), port = await reservePort();
@@ -21,7 +29,7 @@ async function startReference() {
   let batch: Bun.Subprocess | undefined;
   let host: RuntimeHost | undefined;
   const close = async () => {
-    try { host?.close(); } finally {
+    try { await host?.close(); } finally {
       try { if (batch) await stopProcess(batch); } finally { await stopProcess(kernel); }
     }
   };
@@ -44,29 +52,59 @@ async function startReference() {
       if (performance.now() >= deadline) throw new Error("Original service not ready");
       await Bun.sleep(10);
     }
-    return { host, startup_ms: performance.now() - started, close };
+    const launch_config = {
+      kernel: { binary: binary("lenso-runtime"), args: ["--listen", `127.0.0.1:${port}`] },
+      batch: { binary: binary("logs-batch"), runtime_port: port },
+      caller: { namespace: "demo", service: "check", instance: "original", port },
+    };
+    const config_sha256 = sha256(Buffer.from(JSON.stringify(launch_config)));
+    return { host, startup_ms: performance.now() - started, config_sha256, launch_config, close };
   } catch (error) { await close(); throw error; }
 }
 
-const runs = [];
-for (let round = 0; round < 3; round++) {
-  for (const path of round % 2 ? ["current", "original"] : ["original", "current"]) {
+const runs: ({ round: number; path: string; config_sha256: string; launch_config: Json } & Awaited<ReturnType<typeof measure>>)[] = [];
+for (const [round, order] of balancedOrders(["original", "current"], count).entries()) {
+  for (const path of order) {
     const runtime = path === "original" ? await startReference() : await startTransport("tcp");
-    try { runs.push({ round, path, ...await measure(runtime.host, runtime.startup_ms) }); }
+    try {
+      runs.push({ round, path, config_sha256: runtime.config_sha256, launch_config: runtime.launch_config, ...await measure(runtime.host, runtime.startup_ms) });
+      if ("verifyConfig" in runtime && typeof runtime.verifyConfig === "function") await runtime.verifyConfig();
+    }
     finally { await runtime.close(); }
   }
 }
-const output = resolve(root, "examples/multitransport/tcp-regression-check.json");
-const previous = await Bun.file(output).exists() ? await Bun.file(output).json() : undefined;
+rejectDrift(before, { current: await provenance(root), original: await provenance(referenceRoot, root) });
+rejectDrift(reference, await verifyReferenceSource(root, referenceRoot, revision, baseline));
+const comparisons = runs[0]!.conditions.map((condition, index) => {
+  const pairs = Array.from({ length: count }, (_, round) => {
+    const current = runs.find(run => run.round === round && run.path === "current")!.conditions[index]!;
+    const reference = runs.find(run => run.round === round && run.path === "original")!.conditions[index]!;
+    assert.equal(current.requests, reference.requests);
+    assert.equal(current.errors, 0);
+    assert.equal(reference.errors, 0);
+    return { current, reference };
+  });
+  return {
+    records: condition.records, concurrency: condition.concurrency,
+    throughput: pairedRatios(pairs.map(p => ({ current: p.current.throughput_per_second, reference: p.reference.throughput_per_second }))),
+    p50: pairedRatios(pairs.map(p => ({ current: p.current.latency_ms.p50!, reference: p.reference.latency_ms.p50! }))),
+    p95: pairedRatios(pairs.map(p => ({ current: p.current.latency_ms.p95!, reference: p.reference.latency_ms.p95! }))),
+    p99: pairedRatios(pairs.map(p => ({ current: p.current.latency_ms.p99!, reference: p.reference.latency_ms.p99! }))),
+  };
+});
 const report = {
   captured_at: new Date().toISOString(),
-  reference_revision: baseline.revision,
-  reference_source_sha256: baseline.source_sha256,
-  note: "Three alternating original/current TCP runs. Original uses archived kernel, Rust SDK, Rust service and TypeScript RuntimeHost, not a native/process-labelled proxy. Same measure() payloads, generated client checks, 50 warmups and 300 requests per condition. Startup methods differ and are not a speed comparison. No concurrent builds/tests.",
-  runs,
-  before_optimization: previous?.before_optimization ?? previous?.runs,
+  ...reference,
+  environment, environment_after: benchmarkEnvironment(),
+  note: "Alternating paired v2 original/current TCP runs with equivalent build proof verification. Original uses archived kernel, Rust SDK/service and TypeScript RuntimeHost. Independent concurrency warmups; validation enabled. Startup differs and is not a speed comparison. p99 descriptive; differences below paired ratio range are inconclusive. Historical v1 results are a separate cohort. Run only after other builds/tests stop.",
+  runs, comparisons,
+  provenance_identity: Object.fromEntries(Object.entries(before).map(([name, proof]) => [name, {
+    source_sha256: sha256(Buffer.from(JSON.stringify(proof.source))),
+    application_source_sha256: sha256(Buffer.from(JSON.stringify(proof.application_source))),
+    harness_sha256: sha256(Buffer.from(JSON.stringify(proof.harness))), binaries: proof.binaries,
+  }])),
 };
-await Bun.write(output, JSON.stringify(report, null, 2) + "\n");
+await writeEvidence(root, { ...report, manifests: before }, output);
 console.log(JSON.stringify(runs.map(({ round, path, conditions }) => ({
   round, path, conditions: conditions.map(({ records, concurrency, latency_ms, throughput_per_second, errors }) =>
     ({ records, concurrency, latency_ms, throughput_per_second, errors })),

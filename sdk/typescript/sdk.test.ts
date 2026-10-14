@@ -1,9 +1,9 @@
 import { afterEach, expect, test } from "bun:test";
 import { createServer, type Socket } from "node:net";
-import { BusinessError, RuntimeHost, type Handler } from "@lenso/runtime-sdk";
+import { BusinessError, RuntimeError, RuntimeHost, type Handler } from "@lenso/runtime-sdk";
 import { type Contract, type Schema, validateValue } from "./schema";
 import { generate } from "../../tools/generate";
-import { LogsClient } from "../../examples/generated/logs";
+import { LogsClient, logsContract, isAggregateError, isProgressError } from "../../examples/generated/logs";
 import schemaCases from "../../crates/sdk/tests/schema-cases.json";
 
 test("shared restricted schema fixtures agree on constraints and presence", () => {
@@ -29,6 +29,14 @@ const contract: Contract = {
   },
 };
 const target = { namespace: "demo", service: "worker", contractVersion: "1" };
+function copyMethod(method: Contract["methods"][string]): Contract["methods"][string] {
+  return {
+    mode: method.mode,
+    input: structuredClone(method.input),
+    output: structuredClone(method.output),
+    error: structuredClone(method.error),
+  };
+}
 const cleanup: (() => void)[] = [];
 afterEach(() => {
   for (const close of cleanup.splice(0)) close();
@@ -86,7 +94,7 @@ async function fixture(handlers: Record<string, Handler> = {}, maxConcurrency = 
   const exported = {
     version: "1",
     methods: Object.fromEntries(
-      Object.keys(handlers).map((name) => [name, contract.methods[name]!]),
+      Object.keys(handlers).map((name) => [name, copyMethod(contract.methods[name]!)]),
     ),
   };
   const host = await RuntimeHost.connect({
@@ -116,7 +124,7 @@ async function fixture(handlers: Record<string, Handler> = {}, maxConcurrency = 
       trace_id: "trace",
       caller: { namespace: "demo", service: "caller", instance: "one" },
     });
-  return { host, next, send, raw, invoke, frames, disconnect: () => transport === "tcp" ? peer.destroy() : wsPeer.close(), halfClose: () => peer.end() };
+  return { host, next, send, raw, invoke, frames, exported, disconnect: () => transport === "tcp" ? peer.destroy() : wsPeer.close(), halfClose: () => peer.end() };
 }
 test("promotion uses scoped operator frame and commit acknowledgement, with no retry", async () => {
   const f = await fixture();
@@ -253,6 +261,108 @@ test("host stream does not advance its iterator before credit and cancels waitin
   expect(await f.next("error")).toMatchObject({ code: "cancelled" });
   expect(cancelled).toBe(true);
 });
+test("many-item producer keeps only one scoped abort subscription and removes it at completion", async () => {
+  const active = new Set<unknown>();
+  let peak = 0, subscriptions = 0;
+  const count = 512;
+  const f = await fixture({
+    stream: (_input: unknown, { signal }: { signal: AbortSignal }) => {
+      const add = signal.addEventListener.bind(signal);
+      const remove = signal.removeEventListener.bind(signal);
+      signal.addEventListener = (type: string, listener: EventListenerOrEventListenerObject, options?: boolean | AddEventListenerOptions) => {
+        if (type === "abort") {
+          active.add(listener);
+          subscriptions++;
+          peak = Math.max(peak, active.size);
+        }
+        add(type, listener, options);
+      };
+      signal.removeEventListener = (type: string, listener: EventListenerOrEventListenerObject, options?: boolean | EventListenerOptions) => {
+        if (type === "abort") active.delete(listener);
+        remove(type, listener, options);
+      };
+      return (async function* () {
+        for (let value = 0; value < count; value++) yield { value };
+      })();
+    },
+  });
+  f.invoke("many", "stream", 10000);
+  for (let value = 0; value < count; value++) {
+    f.send({ type: "credit", id: "many", credits: 1 });
+    expect(await f.next("chunk")).toMatchObject({ output: { value } });
+    expect(active.size).toBeLessThanOrEqual(1);
+  }
+  f.send({ type: "credit", id: "many", credits: 1 });
+  expect(await f.next("end")).toMatchObject({ id: "many" });
+  expect(subscriptions).toBeGreaterThanOrEqual(count + 2);
+  expect(peak).toBe(1);
+  expect(active.size).toBe(0);
+});
+for (const stage of ["handler resolve", "handler reject", "credit", "next resolve", "next reject"]) {
+  test(`producer cancellation during ${stage} retains local work and iterator cleanup`, async () => {
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let settle!: () => void;
+    let returned!: () => void;
+    const returning = new Promise<void>((resolve) => { returned = resolve; });
+    let finishReturn!: () => void;
+    const returnWork = new Promise<void>((resolve) => { finishReturn = resolve; });
+    let advances = 0;
+    const iterator = {
+      [Symbol.asyncIterator]() { return this; },
+      next() {
+        advances++;
+        entered();
+        return new Promise<IteratorResult<{ value: number }>>((resolve, reject) => {
+          settle = () => stage.endsWith("reject")
+            ? reject(new Error("late next failure"))
+            : resolve({ done: false, value: { value: 1 } });
+        });
+      },
+      async return() {
+        returned();
+        await returnWork;
+        return { done: true as const, value: undefined };
+      },
+    };
+    const f = await fixture({
+      stream: () => {
+        if (!stage.startsWith("handler")) {
+          if (stage === "credit") entered();
+          return iterator;
+        }
+        entered();
+        return new Promise((resolve, reject) => {
+          settle = () => stage.endsWith("reject")
+            ? reject(new Error("late handler failure"))
+            : resolve(iterator);
+        });
+      },
+    }, 1);
+    f.invoke("cancelled", "stream");
+    if (stage.startsWith("next"))
+      f.send({ type: "credit", id: "cancelled", credits: 1 });
+    await started;
+    f.send({ type: "cancel", id: "cancelled" });
+    expect(await f.next("error")).toMatchObject({ id: "cancelled", code: "cancelled" });
+    expect(advances).toBe(stage.startsWith("next") ? 1 : 0);
+    f.invoke("blocked", "stream");
+    expect(await f.next("error")).toMatchObject({ id: "blocked", code: "overloaded" });
+    let drained = false;
+    const drain = f.host.drain(1000).then(() => { drained = true; });
+    await f.next("drain");
+    f.send({ type: "drained" });
+    if (stage !== "credit") settle();
+    if (stage !== "handler reject") {
+      await returning;
+      await Bun.sleep(0);
+      expect(drained).toBe(false);
+    }
+    finishReturn();
+    await drain;
+    expect(f.frames.filter((frame) => ["chunk", "end", "error"].includes(frame.type))).toEqual([]);
+  });
+}
 test("drain is explicit, bounded and rejects new calls", async () => {
   const f = await fixture();
   const drain = f.host.drain(100);
@@ -534,4 +644,159 @@ test("TCP handles split UTF-8, coalesced lines and peer half-close", async () =>
 test("WebSocket accepts only literal numeric loopback without credentials or tokens", async () => {
   for (const url of ["wss://127.0.0.1", "ws://localhost", "ws://192.168.1.1", "ws://127.1", "ws://2130706433", "ws://user@127.0.0.1", "ws://127.0.0.1?token=x", "ws://127.0.0.1/#x"])
     await expect(RuntimeHost.connect({ namespace: "demo", service: "sdk", instance: "one", contract: { version: "1", methods: {} }, transport: { type: "websocket", url } })).rejects.toMatchObject({ code: "invalid_input" });
+});
+
+test("raw caller definitions observe nested input/output/error mutation between calls", async () => {
+  const f = await fixture();
+  const definition = copyMethod(contract.methods.unary!);
+  definition.input.properties!.value!.maximum = 0;
+  await expect(f.host.call(target, "unary", { value: 1 }, { contract: definition })).rejects.toMatchObject({ code: "invalid_input" });
+  definition.input.properties!.value!.maximum = 1;
+  const accepted = f.host.call(target, "unary", { value: 1 }, { contract: definition });
+  const first = await f.next("call");
+  definition.output.properties!.value!.maximum = 0;
+  f.send({ type: "result", id: first.id, output: { value: 1 } });
+  await expect(accepted).rejects.toMatchObject({ code: "invalid_output" });
+  definition.output.properties!.value!.maximum = 1;
+  const business = f.host.call(target, "unary", { value: 1 }, { contract: definition });
+  const second = await f.next("call");
+  definition.error.properties!.value!.maximum = 0;
+  f.send({ type: "error", id: second.id, code: "business", message: "safe", details: { value: 1 } });
+  await expect(business).rejects.toMatchObject({ code: "invalid_output" });
+});
+
+test("raw host contract input/output/error mutations remain live between invocations", async () => {
+  let business = false;
+  const f = await fixture({ unary: () => {
+    if (business) throw new BusinessError({ value: 1 });
+    return { value: 1 };
+  } });
+  const definition = f.exported.methods.unary!;
+  definition.input.properties!.value!.maximum = 0;
+  f.invoke("input", "unary");
+  expect(await f.next("error")).toMatchObject({ id: "input", code: "invalid_input" });
+  definition.input.properties!.value!.maximum = 1;
+  definition.output.properties!.value!.maximum = 0;
+  f.invoke("output", "unary");
+  expect(await f.next("error")).toMatchObject({ id: "output", code: "invalid_output" });
+  definition.output.properties!.value!.maximum = 1;
+  f.invoke("accepted", "unary");
+  expect(await f.next("result")).toMatchObject({ id: "accepted", output: { value: 1 } });
+  business = true;
+  definition.error.properties!.value!.maximum = 0;
+  f.invoke("business", "unary");
+  expect(await f.next("error")).toMatchObject({ id: "business", code: "invalid_output" });
+});
+
+test.each(["output", "error"] as const)("raw host stream keeps its captured method but observes nested %s mutation", async (field) => {
+  const f = await fixture({ stream: async function* () {
+    yield { value: 1 };
+    if (field === "error") throw new BusinessError({ value: 1 });
+    yield { value: 1 };
+    yield { value: 1 };
+  } });
+  const captured = f.exported.methods.stream!;
+  f.invoke("live", "stream");
+  f.send({ type: "credit", id: "live", credits: 1 });
+  expect(await f.next("chunk")).toMatchObject({ output: { value: 1 } });
+  const replacement = structuredClone(captured);
+  replacement[field].properties!.value!.maximum = 0;
+  f.exported.methods.stream = replacement;
+  if (field === "output") {
+    f.send({ type: "credit", id: "live", credits: 1 });
+    expect(await f.next("chunk")).toMatchObject({ output: { value: 1 } });
+    // A fresh invocation sees the replacement, unlike the existing one.
+    f.invoke("replacement", "stream");
+    f.send({ type: "credit", id: "replacement", credits: 1 });
+    expect(await f.next("error")).toMatchObject({ id: "replacement", code: "invalid_output" });
+    // Use field replacement on the captured object, not only nested mutation.
+    captured.output = { ...captured.output, properties: { value: { type: "integer", maximum: 0 } } };
+    f.send({ type: "credit", id: "live", credits: 1 });
+    expect(await f.next("error")).toMatchObject({ id: "live", code: "invalid_output" });
+  } else {
+    captured.error.properties!.value!.maximum = 0;
+    f.send({ type: "credit", id: "live", credits: 1 });
+    expect(await f.next("error")).toMatchObject({ id: "live", code: "invalid_output" });
+  }
+});
+
+test.each(["output", "error"] as const)("raw caller streams retain captured definitions and observe nested %s mutation", async (field) => {
+  const f = await fixture();
+  const captured = copyMethod(contract.methods.stream!);
+  const options = { contract: captured };
+  const stream = f.host.stream(target, "stream", { value: 1 }, options);
+  const call = await f.next("call");
+  options.contract = structuredClone(captured);
+  options.contract.output.properties!.value!.maximum = 0;
+  const first = stream.next();
+  await f.next("credit");
+  f.send({ type: "chunk", id: call.id, output: { value: 1 } });
+  expect(await first).toEqual({ done: false, value: { value: 1 } });
+  captured.input.properties!.value!.maximum = 0;
+  expect(() => f.host.stream(target, "stream", { value: 1 }, { contract: captured })).toThrow();
+  captured[field].properties!.value!.maximum = 0;
+  const next = stream.next();
+  await f.next("credit");
+  f.send(field === "output"
+    ? { type: "chunk", id: call.id, output: { value: 1 } }
+    : { type: "error", id: call.id, code: "business", message: "safe", details: { value: 1 } });
+  await expect(next).rejects.toMatchObject({ code: "invalid_output" });
+  expect(await f.next("cancel")).toMatchObject({ id: call.id });
+});
+
+test("generated clients and error guards keep mutable exported method lookup semantics", async () => {
+  const f = await fixture();
+  const original = logsContract.methods.aggregate!;
+  const replacement = structuredClone(original);
+  const input = { logs: [{ level: "info", message: "synthetic", duration_ms: 1 }] };
+  const failure = new RuntimeError("business", "safe", { reason: "long" });
+  try {
+    logsContract.methods.aggregate = replacement;
+    replacement.input.properties!.logs!.maxItems = 0;
+    const client = new LogsClient(f.host, target);
+    await expect(client.aggregate(input)).rejects.toMatchObject({ code: "invalid_input" });
+    replacement.input.properties!.logs!.maxItems = 1;
+    const call = client.aggregate(input);
+    const request = await f.next("call");
+    replacement.output.properties!.count!.maximum = 0;
+    f.send({ type: "result", id: request.id, output: { count: 1, error_count: 0, total_duration_ms: 1 } });
+    await expect(call).rejects.toMatchObject({ code: "invalid_output" });
+    expect(isAggregateError(failure)).toBe(true);
+    replacement.error.properties!.reason!.maxLength = 1;
+    expect(isAggregateError(failure)).toBe(false);
+    logsContract.methods.aggregate = original;
+    expect(isAggregateError(failure)).toBe(true);
+  } finally {
+    logsContract.methods.aggregate = original;
+  }
+});
+
+test("generated streams distinguish method replacement from captured nested mutation", async () => {
+  const f = await fixture();
+  const original = logsContract.methods.progress!;
+  const captured = copyMethod(original);
+  const input = { logs: [{ level: "info", message: "synthetic", duration_ms: 1 }] };
+  try {
+    logsContract.methods.progress = captured;
+    const client = new LogsClient(f.host, target);
+    const stream = client.progress(input);
+    const call = await f.next("call");
+    const replacement = copyMethod(captured);
+    replacement.output.properties!.processed!.maximum = 0;
+    replacement.error.properties!.reason!.maxLength = 1;
+    logsContract.methods.progress = replacement;
+    expect(isProgressError(new RuntimeError("business", "safe", { reason: "long" }))).toBe(false);
+    const first = stream.next();
+    await f.next("credit");
+    f.send({ type: "chunk", id: call.id, output: { processed: 1, total: 1 } });
+    expect(await first).toEqual({ done: false, value: { processed: 1, total: 1 } });
+    captured.output.properties!.processed!.maximum = 0;
+    const second = stream.next();
+    await f.next("credit");
+    f.send({ type: "chunk", id: call.id, output: { processed: 1, total: 1 } });
+    await expect(second).rejects.toMatchObject({ code: "invalid_output" });
+    expect(await f.next("cancel")).toMatchObject({ id: call.id });
+  } finally {
+    logsContract.methods.progress = original;
+  }
 });

@@ -2,6 +2,7 @@ import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import { resolve, join } from "node:path";
 import { RuntimeHost } from "@lenso/runtime-sdk";
 import { emptyContract, reservePort, stopProcess } from "../../scripts/local";
+import { sha256, rejectDrift, type Json } from "../../scripts/benchmark-evidence";
 
 export type TargetTransport = "tcp" | "stdio" | "websocket";
 export interface ProcessConfig {
@@ -49,6 +50,14 @@ export async function startTransport(
     ...child,
     env: { LENSO_RUNTIME_URL: url, ...child.env },
   }))]));
+  const config_sha256 = sha256(new Uint8Array(await Bun.file(config).arrayBuffer()));
+  const launch_config: Json = JSON.parse(JSON.stringify({
+    owned: await Bun.file(config).json(),
+    standalone: [...(target === "websocket" ? [batch] : []), ...independent],
+    kernel_args: ["--listen", `127.0.0.1:${port}`, "--websocket", `127.0.0.1:${wsPort}`, "--processes", config],
+    caller: { namespace: "demo", service: "verification", instance: "transport-one", port, transport: "tcp" },
+    port, url,
+  }));
   const kernel = Bun.spawn([
     resolve(root, "target/release/lenso-runtime"),
     "--listen", `127.0.0.1:${port}`, "--websocket", `127.0.0.1:${wsPort}`,
@@ -100,6 +109,10 @@ export async function startTransport(
     }
     return {
       host, kernel, port, url, startup_ms: performance.now() - start,
+      config_sha256, launch_config,
+      async verifyConfig() {
+        rejectDrift(config_sha256, sha256(new Uint8Array(await Bun.file(config).arrayBuffer())));
+      },
       async close() {
         try { await host!.close(); }
         finally {

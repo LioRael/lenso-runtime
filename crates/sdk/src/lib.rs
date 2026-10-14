@@ -20,6 +20,8 @@ use tokio::{
 pub use transport::diagnostics;
 use transport::{Connection, Reader, Writer};
 
+mod prepared;
+
 struct BoundedJson {
     bytes: Vec<u8>,
 }
@@ -49,6 +51,8 @@ fn bounded_json<T: Serialize>(value: &T, code: &str) -> Result<Vec<u8>, RuntimeE
     Ok(writer.bytes)
 }
 fn bounded_value<T: Serialize>(value: &T, code: &str) -> Result<Value, RuntimeError> {
+    #[cfg(test)]
+    tests::record_conversion();
     let bytes = bounded_json(value, code)?;
     serde_json::from_slice(&bytes).map_err(|_| RuntimeError::new(code))
 }
@@ -152,6 +156,12 @@ impl HostOptions {
 
     /// The retained port field is ignored for stdio and WebSocket connections.
     pub fn validate_for_transport(&self, transport: &Transport) -> Result<(), RuntimeError> {
+        self.validate_configuration(transport)?;
+        protocol::validate_contract(&self.contract)
+            .map_err(|_| RuntimeError::new("contract_mismatch"))
+    }
+
+    fn validate_configuration(&self, transport: &Transport) -> Result<(), RuntimeError> {
         if (matches!(transport, Transport::Tcp) && self.port == 0)
             || !(1..=64).contains(&self.max_concurrency)
         {
@@ -162,8 +172,7 @@ impl HostOptions {
             "namespace": self.namespace, "service": self.service, "instance": self.instance,
         }))
         .map_err(|_| RuntimeError::new("invalid_input"))?;
-        protocol::validate_contract(&self.contract)
-            .map_err(|_| RuntimeError::new("contract_mismatch"))
+        Ok(())
     }
 }
 #[derive(Clone)]
@@ -206,6 +215,10 @@ impl Handlers {
     pub fn validate(&self, contract: &Value) -> Result<(), RuntimeError> {
         protocol::validate_contract(contract)
             .map_err(|_| RuntimeError::new("contract_mismatch"))?;
+        self.validate_bindings(contract)
+    }
+
+    fn validate_bindings(&self, contract: &Value) -> Result<(), RuntimeError> {
         let methods = contract["methods"]
             .as_object()
             .ok_or_else(|| RuntimeError::new("contract_mismatch"))?;
@@ -272,7 +285,7 @@ impl Handlers {
 pub struct StreamSender<T> {
     inner: Arc<Inner>,
     id: String,
-    schema: Value,
+    schema: Arc<protocol::PreparedSchema>,
     credits: Arc<Semaphore>,
     marker: PhantomData<T>,
 }
@@ -295,7 +308,8 @@ impl<T: Serialize> StreamSender<T> {
             .await
             .map_err(|_| RuntimeError::new("cancelled"))?;
         let output = bounded_value(&output, "invalid_output")?;
-        protocol::validate_value(&self.schema, &output)
+        self.schema
+            .validate_value(&output)
             .map_err(|_| RuntimeError::new("invalid_output"))?;
         self.inner
             .send(json!({"type":"chunk","id":self.id,"output":output}))?;
@@ -365,7 +379,7 @@ impl Drop for Execution {
 }
 struct Inner {
     writer: mpsc::Sender<Vec<u8>>,
-    contract: Value,
+    contract: protocol::PreparedContract,
     host_handles: AtomicUsize,
     closed: Cancellation,
     accepting: AtomicBool,
@@ -493,8 +507,11 @@ impl RuntimeHost {
         handlers: Handlers,
         transport: Transport,
     ) -> Result<Self, RuntimeError> {
-        handlers.validate(&options.contract)?;
-        let host = Self::connect_registered_with_transport(options, transport).await?;
+        let contract = protocol::PreparedContract::new(&options.contract)
+            .map_err(|_| RuntimeError::new("contract_mismatch"))?;
+        handlers.validate_bindings(contract.original())?;
+        options.validate_configuration(&transport)?;
+        let host = Self::connect_registered_prepared(options, transport, contract).await?;
         host.activate(handlers).await?;
         Ok(host)
     }
@@ -509,8 +526,18 @@ impl RuntimeHost {
         options: HostOptions,
         transport: Transport,
     ) -> Result<Self, RuntimeError> {
+        options.validate_configuration(&transport)?;
+        let contract = protocol::PreparedContract::new(&options.contract)
+            .map_err(|_| RuntimeError::new("contract_mismatch"))?;
+        Self::connect_registered_prepared(options, transport, contract).await
+    }
+
+    async fn connect_registered_prepared(
+        options: HostOptions,
+        transport: Transport,
+        contract: protocol::PreparedContract,
+    ) -> Result<Self, RuntimeError> {
         let stdio = matches!(&transport, Transport::Stdio);
-        options.validate_for_transport(&transport)?;
         let setup = async {
             let mut connection = match transport {
                 Transport::Tcp => Connection::tcp(
@@ -552,7 +579,7 @@ impl RuntimeHost {
         let (writer, mut receiver) = mpsc::channel::<Vec<u8>>(64);
         let inner = Arc::new(Inner {
             writer,
-            contract: options.contract.clone(),
+            contract,
             host_handles: AtomicUsize::new(1),
             closed: Cancellation::new(),
             accepting: AtomicBool::new(true),
@@ -643,7 +670,7 @@ impl RuntimeHost {
 
     /// Check explicit exports without publishing readiness or changing the connection.
     pub fn validate_handlers(&self, handlers: &Handlers) -> Result<(), RuntimeError> {
-        handlers.validate(&self.inner.contract)
+        handlers.validate_bindings(self.inner.contract.original())
     }
 
     /// Bind the exact registered methods once and await the kernel's ready acknowledgement.
@@ -664,7 +691,7 @@ impl RuntimeHost {
             if self.inner.state().activation.is_some() {
                 return Err(RuntimeError::new("invalid_input"));
             }
-            if let Err(error) = handlers.validate(&self.inner.contract) {
+            if let Err(error) = handlers.validate_bindings(self.inner.contract.original()) {
                 self.inner.fail(error.clone());
                 return Err(error);
             }
@@ -796,7 +823,7 @@ impl RuntimeHost {
         protocol::validate_value(&definition["input"], &input)
             .map_err(|_| RuntimeError::new("invalid_input"))?;
         let output: Value = self
-            .call(target, method, input, options)
+            .call_value(target, method, input, options)
             .await
             .map_err(|error| validate_business(error, definition))?;
         protocol::validate_value(&definition["output"], &output)
@@ -815,8 +842,8 @@ impl RuntimeHost {
         let input = bounded_value(&input, "invalid_input")?;
         protocol::validate_value(&definition["input"], &input)
             .map_err(|_| RuntimeError::new("invalid_input"))?;
-        let mut stream = self.stream(target, method, input, options)?;
-        stream.definition = Some(definition.clone());
+        let mut stream = self.stream_value(target, method, input, options)?;
+        stream.definition = Some(prepared::StreamValidation::new(definition));
         Ok(stream)
     }
     /// Dropping the future cancels its route, including while queued.
@@ -828,6 +855,15 @@ impl RuntimeHost {
         options: CallOptions,
     ) -> Result<O, RuntimeError> {
         let input = bounded_value(&input, "invalid_input")?;
+        self.call_value(target, method, input, options).await
+    }
+    async fn call_value<O: DeserializeOwned>(
+        &self,
+        target: &Target,
+        method: &str,
+        input: Value,
+        options: CallOptions,
+    ) -> Result<O, RuntimeError> {
         let (sender, receiver) = oneshot::channel();
         let _guard = self.start(target, method, input, &options, PendingKind::Unary(sender))?;
         let output = receiver
@@ -843,6 +879,15 @@ impl RuntimeHost {
         options: CallOptions,
     ) -> Result<ResponseStream<O>, RuntimeError> {
         let input = bounded_value(&input, "invalid_input")?;
+        self.stream_value(target, method, input, options)
+    }
+    fn stream_value<O: DeserializeOwned>(
+        &self,
+        target: &Target,
+        method: &str,
+        input: Value,
+        options: CallOptions,
+    ) -> Result<ResponseStream<O>, RuntimeError> {
         let (chunks, receiver) = mpsc::channel(1);
         let (terminal, terminal_receiver) = watch::channel(None);
         let credit = Arc::new(AtomicUsize::new(0));
@@ -952,7 +997,7 @@ pub struct ResponseStream<T> {
     credit: Arc<AtomicUsize>,
     done: bool,
     waiting: bool,
-    definition: Option<Value>,
+    definition: Option<prepared::StreamValidation>,
     marker: PhantomData<T>,
 }
 fn validate_business(error: RuntimeError, definition: &Value) -> RuntimeError {
@@ -971,8 +1016,9 @@ impl<T: DeserializeOwned> ResponseStream<T> {
     fn decode(&mut self, value: Value) -> Result<Option<T>, RuntimeError> {
         let result = (|| {
             if let Some(definition) = &self.definition {
-                protocol::validate_value(&definition["output"], &value)
-                    .map_err(|_| RuntimeError::new("invalid_output"))?;
+                if !definition.output_valid(&value) {
+                    return Err(RuntimeError::new("invalid_output"));
+                }
             }
             serde_json::from_value(value)
                 .map(Some)
@@ -989,7 +1035,16 @@ impl<T: DeserializeOwned> ResponseStream<T> {
     }
     fn terminal_result(&self, result: Result<(), RuntimeError>) -> Result<(), RuntimeError> {
         result.map_err(|error| match &self.definition {
-            Some(definition) => validate_business(error, definition),
+            Some(definition)
+                if error.code == "business"
+                    && error
+                        .details
+                        .as_ref()
+                        .is_none_or(|details| !definition.error_valid(details)) =>
+            {
+                RuntimeError::new("invalid_output")
+            }
+            Some(_) => error,
             None => error,
         })
     }
@@ -1173,8 +1228,9 @@ fn receive(inner: &Arc<Inner>, frame: Value, options: &HostOptions) -> Result<()
             let method = frame["method"]
                 .as_str()
                 .ok_or_else(|| RuntimeError::new("protocol_error"))?;
-            let definition = options.contract["methods"]
-                .get(method)
+            let definition = inner
+                .contract
+                .method(method)
                 .cloned()
                 .ok_or_else(|| RuntimeError::new("protocol_error"))?;
             let handler = {
@@ -1224,7 +1280,7 @@ fn receive(inner: &Arc<Inner>, frame: Value, options: &HostOptions) -> Result<()
                     Invocation {
                         cancellation: context.cancellation.clone(),
                         credits: credits.clone(),
-                        stream: definition["mode"] == "stream",
+                        stream: definition.is_stream(),
                     },
                 );
                 state.executions += 1;
@@ -1240,20 +1296,24 @@ fn receive(inner: &Arc<Inner>, frame: Value, options: &HostOptions) -> Result<()
                 // Declared first so handler futures and their permits drop before this lease.
                 let _execution = execution;
                 let operation = async {
-                    protocol::validate_value(&definition["input"], &frame["input"])
+                    definition
+                        .input()
+                        .validate_value(&frame["input"])
                         .map_err(|_| RuntimeError::new("invalid_input"))?;
                     let handler = handler.ok_or_else(|| RuntimeError::new("not_ready"))?;
                     let sender = StreamSender {
                         inner: inner.clone(),
                         id: id.clone(),
-                        schema: definition["output"].clone(),
+                        schema: definition.output().clone(),
                         credits: credits.clone(),
                         marker: PhantomData,
                     };
                     let output = handler(frame["input"].clone(), context.clone(), sender).await?;
-                    if definition["mode"] == "unary" {
+                    if !definition.is_stream() {
                         let output = output.ok_or_else(|| RuntimeError::new("invalid_output"))?;
-                        protocol::validate_value(&definition["output"], &output)
+                        definition
+                            .output()
+                            .validate_value(&output)
                             .map_err(|_| RuntimeError::new("invalid_output"))?;
                         inner.send(json!({"type":"result","id":id,"output":output}))
                     } else {
@@ -1269,11 +1329,10 @@ fn receive(inner: &Arc<Inner>, frame: Value, options: &HostOptions) -> Result<()
                 };
                 if let Err(mut error) = result {
                     if error.code == "business"
-                        && protocol::validate_value(
-                            &definition["error"],
-                            error.details.as_ref().unwrap_or(&Value::Null),
-                        )
-                        .is_err()
+                        && definition
+                            .error()
+                            .validate_value(error.details.as_ref().unwrap_or(&Value::Null))
+                            .is_err()
                     {
                         error = RuntimeError::new("invalid_output");
                     }
@@ -1349,8 +1408,61 @@ fn receive(inner: &Arc<Inner>, frame: Value, options: &HostOptions) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::ser::SerializeSeq;
+    use std::{cell::Cell, rc::Rc};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    thread_local! {
+        static CONVERSIONS: Cell<Option<usize>> = const { Cell::new(None) };
+    }
+
+    pub(super) fn record_conversion() {
+        CONVERSIONS.with(|count| {
+            if let Some(current) = count.get() {
+                count.set(Some(current + 1));
+            }
+        });
+    }
+
+    // The guard must stay on its current-thread runtime, including across awaits.
+    struct ConversionCount {
+        previous: Option<usize>,
+        marker: PhantomData<Rc<()>>,
+    }
+    impl ConversionCount {
+        fn scoped() -> Self {
+            Self {
+                previous: CONVERSIONS.with(|count| count.replace(Some(0))),
+                marker: PhantomData,
+            }
+        }
+        fn get(&self) -> usize {
+            CONVERSIONS.with(|count| count.get().unwrap())
+        }
+    }
+    impl Drop for ConversionCount {
+        fn drop(&mut self) {
+            CONVERSIONS.with(|count| count.set(self.previous));
+        }
+    }
+
+    struct HugeSequence {
+        elements: Cell<usize>,
+    }
+    impl Serialize for HugeSequence {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let mut sequence = serializer.serialize_seq(None)?;
+            for _ in 0..protocol::MAX_FRAME_BYTES {
+                let attempted = self.elements.get() + 1;
+                self.elements.set(attempted);
+                // Fail safely if a regression starts collecting an unbounded Value.
+                assert!(attempted <= (protocol::MAX_FRAME_BYTES - 1) / 21 + 1);
+                sequence.serialize_element(&u64::MAX)?;
+            }
+            sequence.end()
+        }
+    }
 
     async fn write_frame(socket: &mut TcpStream, frame: &Value) -> Result<(), RuntimeError> {
         socket
@@ -1756,6 +1868,13 @@ mod tests {
             .unwrap_err();
         assert_eq!(error.code, "invalid_input");
         assert!(host.inner.state().pending.is_empty());
+        let error = host
+            .stream_contract::<_, i64>(&target(), "work", -1, CallOptions::default(), &definition)
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "invalid_input");
+        assert!(host.inner.state().pending.is_empty());
+        assert_eq!(host.inner.sequence.load(Ordering::Relaxed), 0);
         for reply in [
             json!({"type":"result","output":3}),
             json!({"type":"error","code":"business","message":"failed","details":"long"}),
@@ -1777,6 +1896,314 @@ mod tests {
             reply["id"] = frame["id"].clone();
             write_frame(&mut peer, &reply).await.unwrap();
             assert_eq!(call.await.unwrap().unwrap_err().code, "invalid_output");
+        }
+        host.close();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn contract_call_converts_input_once() {
+        let (host, mut peer) = fixture().await;
+        let definition = json!({"input":{"type":"integer"},"output":{"type":"integer"}});
+        let count = ConversionCount::scoped();
+        let before = count.get();
+        let (output, ()) = tokio::join!(
+            async {
+                host.call_contract::<_, i64>(
+                    &target(),
+                    "work",
+                    7,
+                    CallOptions::default(),
+                    &definition,
+                )
+                .await
+                .unwrap()
+            },
+            async {
+                let frame = next(&mut peer, "call").await;
+                assert_eq!(frame["input"], 7);
+                write_frame(
+                    &mut peer,
+                    &json!({"type":"result","id":frame["id"],"output":8}),
+                )
+                .await
+                .unwrap();
+            }
+        );
+        assert_eq!(output, 8);
+        assert_eq!(count.get() - before, 1);
+        assert!(host.inner.state().pending.is_empty());
+        host.close();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn contract_stream_initialization_converts_input_once() {
+        let (host, mut peer) = fixture().await;
+        let definition = json!({"input":{"type":"integer"},"output":{"type":"integer"}});
+        let count = ConversionCount::scoped();
+        let before = count.get();
+        let stream: ResponseStream<i64> = host
+            .stream_contract(&target(), "work", 7, CallOptions::default(), &definition)
+            .unwrap();
+        assert_eq!(count.get() - before, 1);
+        assert_eq!(next(&mut peer, "call").await["input"], 7);
+        drop(stream);
+        next(&mut peer, "cancel").await;
+        host.close();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn conversion_counter_detects_old_generic_reentry_for_both_contract_paths() {
+        let (host, mut peer) = fixture().await;
+        let definition = json!({"input":{"type":"integer"},"output":{"type":"integer"}});
+        let count = ConversionCount::scoped();
+        let before = count.get();
+        // Reference the old path: original input -> Value -> generic call/stream.
+        let (output, ()) = tokio::join!(
+            async {
+                let input = bounded_value(&7, "invalid_input").unwrap();
+                protocol::validate_value(&definition["input"], &input).unwrap();
+                host.call::<_, i64>(&target(), "work", input, CallOptions::default())
+                    .await
+                    .unwrap()
+            },
+            async {
+                let frame = next(&mut peer, "call").await;
+                assert_eq!(frame["input"], 7);
+                write_frame(
+                    &mut peer,
+                    &json!({"type":"result","id":frame["id"],"output":8}),
+                )
+                .await
+                .unwrap();
+            }
+        );
+        assert_eq!(output, 8);
+        assert_eq!(count.get() - before, 2);
+        let before = count.get();
+        let input = bounded_value(&7, "invalid_input").unwrap();
+        protocol::validate_value(&definition["input"], &input).unwrap();
+        let stream: ResponseStream<i64> = host
+            .stream(&target(), "work", input, CallOptions::default())
+            .unwrap();
+        assert_eq!(count.get() - before, 2);
+        assert_eq!(next(&mut peer, "call").await["input"], 7);
+        drop(stream);
+        next(&mut peer, "cancel").await;
+        host.close();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn contract_paths_stop_huge_serializers_at_the_frame_budget_before_admission() {
+        let (host, mut peer) = fixture().await;
+        let definition =
+            json!({"input":{"type":"array","items":{"type":"integer"}},"output":{"type":"null"}});
+        let unary = HugeSequence {
+            elements: Cell::new(0),
+        };
+        let error = host
+            .call_contract::<_, Value>(
+                &target(),
+                "work",
+                &unary,
+                CallOptions::default(),
+                &definition,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "invalid_input");
+        assert_eq!(
+            unary.elements.get(),
+            (protocol::MAX_FRAME_BYTES - 1) / 21 + 1
+        );
+        assert!(host.inner.state().pending.is_empty());
+        let streaming = HugeSequence {
+            elements: Cell::new(0),
+        };
+        let error = host
+            .stream_contract::<_, Value>(
+                &target(),
+                "work",
+                &streaming,
+                CallOptions::default(),
+                &definition,
+            )
+            .err()
+            .unwrap();
+        assert_eq!(error.code, "invalid_input");
+        assert_eq!(
+            streaming.elements.get(),
+            (protocol::MAX_FRAME_BYTES - 1) / 21 + 1
+        );
+        assert!(host.inner.state().pending.is_empty());
+        assert_eq!(host.inner.sequence.load(Ordering::Relaxed), 0);
+        // A FIFO barrier proves neither rejected input enqueued a call or cancel.
+        let stream: ResponseStream<Value> = host
+            .stream_contract(
+                &target(),
+                "work",
+                Vec::<u64>::new(),
+                CallOptions::default(),
+                &definition,
+            )
+            .unwrap();
+        assert_eq!(next(&mut peer, "call").await["input"], json!([]));
+        drop(stream);
+        next(&mut peer, "cancel").await;
+        host.close();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn contract_future_drop_and_stream_cancellation_cancel_each_route_once() {
+        let (host, mut peer) = fixture().await;
+        let definition = json!({"input":{"type":"null"},"output":{"type":"integer"}});
+        let route = target();
+        let mut call = Box::pin(host.call_contract::<_, i64>(
+            &route,
+            "work",
+            (),
+            CallOptions::default(),
+            &definition,
+        ));
+        let unary_frame = tokio::select! {
+            result = &mut call => panic!("call completed before reply: {result:?}"),
+            frame = next(&mut peer, "call") => frame,
+        };
+        drop(call);
+        assert_eq!(next(&mut peer, "cancel").await["id"], unary_frame["id"]);
+        assert!(host.inner.state().pending.is_empty());
+
+        let cancellation = Cancellation::new();
+        let mut stream: ResponseStream<i64> = host
+            .stream_contract(
+                &route,
+                "work",
+                (),
+                CallOptions {
+                    cancellation: Some(cancellation.clone()),
+                    ..Default::default()
+                },
+                &definition,
+            )
+            .unwrap();
+        let stream_frame = next(&mut peer, "call").await;
+        assert_ne!(stream_frame["id"], unary_frame["id"]);
+        let (result, ()) = tokio::join!(stream.next(), async {
+            let credit = next(&mut peer, "credit").await;
+            assert_eq!(credit["id"], stream_frame["id"]);
+            assert_eq!(credit["credits"], 1);
+            cancellation.cancel();
+        });
+        assert_eq!(result.unwrap_err().code, "cancelled");
+        assert!(stream.next().await.unwrap().is_none());
+        assert_eq!(next(&mut peer, "cancel").await["id"], stream_frame["id"]);
+        drop(stream);
+        assert!(host.inner.state().pending.is_empty());
+
+        // No repeated next()/Drop cancellation may precede this subsequent route.
+        let stream: ResponseStream<i64> = host
+            .stream_contract(&route, "work", (), CallOptions::default(), &definition)
+            .unwrap();
+        let barrier = next(&mut peer, "call").await;
+        assert_ne!(barrier["id"], stream_frame["id"]);
+        drop(stream);
+        assert_eq!(next(&mut peer, "cancel").await["id"], barrier["id"]);
+        host.close();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn caller_stream_prepares_its_own_captured_bounds_and_checks_every_chunk() {
+        let (host, mut peer) = fixture().await;
+        prepared::reset_work();
+        let mut definition = json!({"input":{"type":"null"},
+            "output":{"type":"integer","maximum":2},
+            "error":{"type":"string","maxLength":1}});
+        let mut stream: ResponseStream<i64> = host
+            .stream_contract(&target(), "work", (), CallOptions::default(), &definition)
+            .unwrap();
+        let frame = next(&mut peer, "call").await;
+        definition["output"]["maximum"] = json!(100);
+        definition["error"]["maxLength"] = json!(100);
+        for _ in 0..32 {
+            let (result, ()) = tokio::join!(stream.next(), async {
+                let credit = next(&mut peer, "credit").await;
+                assert_eq!(credit["id"], frame["id"]);
+                write_frame(
+                    &mut peer,
+                    &json!({"type":"chunk","id":frame["id"],"output":2}),
+                )
+                .await
+                .unwrap();
+            });
+            assert_eq!(result.unwrap(), Some(2));
+        }
+        let (result, ()) = tokio::join!(stream.next(), async {
+            next(&mut peer, "credit").await;
+            write_frame(
+                &mut peer,
+                &json!({"type":"chunk","id":frame["id"],"output":3}),
+            )
+            .await
+            .unwrap();
+        });
+        assert_eq!(result.unwrap_err().code, "invalid_output");
+        assert_eq!(next(&mut peer, "cancel").await["id"], frame["id"]);
+        assert!(stream.next().await.unwrap().is_none());
+        assert!(host.inner.state().pending.is_empty());
+        assert_eq!(prepared::work(), (2, 33));
+        host.close();
+    }
+
+    #[tokio::test]
+    async fn caller_stream_business_errors_use_captured_caller_schema_not_host_schema() {
+        let (host, mut peer) = fixture().await;
+        let mut definition = json!({"input":{"type":"null"},
+            "output":{"type":"integer"},"error":{"type":"string","maxLength":1}});
+        let mut stream: ResponseStream<i64> = host
+            .stream_contract(&target(), "work", (), CallOptions::default(), &definition)
+            .unwrap();
+        let frame = next(&mut peer, "call").await;
+        definition["error"]["maxLength"] = json!(100);
+        let (result, ()) = tokio::join!(stream.next(), async {
+            next(&mut peer, "credit").await;
+            write_frame(
+                &mut peer,
+                &json!({"type":"error","id":frame["id"],
+                "code":"business","message":"safe","details":"long"}),
+            )
+            .await
+            .unwrap();
+        });
+        assert_eq!(result.unwrap_err().code, "invalid_output");
+        assert!(stream.next().await.unwrap().is_none());
+        assert!(host.inner.state().pending.is_empty());
+        host.close();
+    }
+
+    #[tokio::test]
+    async fn malformed_caller_stream_output_is_reported_at_payload_not_admission() {
+        let (host, mut peer) = fixture().await;
+        let definition = json!({"input":{"type":"null"},
+            "output":{"type":"string","format":"date"}});
+        for payload in [false, true] {
+            let mut stream: ResponseStream<Value> = host
+                .stream_contract(&target(), "work", (), CallOptions::default(), &definition)
+                .unwrap();
+            let frame = next(&mut peer, "call").await;
+            let (result, ()) = tokio::join!(stream.next(), async {
+                next(&mut peer, "credit").await;
+                let response = if payload {
+                    json!({"type":"chunk","id":frame["id"],"output":"text"})
+                } else {
+                    json!({"type":"end","id":frame["id"]})
+                };
+                write_frame(&mut peer, &response).await.unwrap();
+            });
+            if payload {
+                assert_eq!(result.unwrap_err().code, "invalid_output");
+                assert_eq!(next(&mut peer, "cancel").await["id"], frame["id"]);
+            } else {
+                assert!(result.unwrap().is_none());
+            }
         }
         host.close();
     }
@@ -1908,7 +2335,8 @@ mod tests {
         let host = RuntimeHost {
             inner: Arc::new(Inner {
                 writer,
-                contract: json!({"version":"1","methods":{}}),
+                contract: protocol::PreparedContract::new(&json!({"version":"1","methods":{}}))
+                    .unwrap(),
                 host_handles: AtomicUsize::new(1),
                 closed: Cancellation::new(),
                 accepting: AtomicBool::new(true),

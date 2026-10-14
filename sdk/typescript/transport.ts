@@ -25,7 +25,7 @@ type Events = {
 export function lineTransport(input: Readable, output: Writable, events: Events, owned = false): Transport {
   const empty = Buffer.alloc(0);
   const decoder = new TextDecoder("utf-8", { fatal: true });
-  let buffer = empty, writes = 0, closed = false;
+  let buffer = empty, used = 0, writes = 0, closed = false, framingFailed = false;
   type Write = { expires: number; done: boolean };
   const pendingWrites: Write[] = [];
   let deadline: ReturnType<typeof setTimeout> | undefined;
@@ -41,7 +41,29 @@ export function lineTransport(input: Readable, output: Writable, events: Events,
     else deadline = setTimeout(watchWrite, remaining);
   };
   const lost = () => fail(events.error("connection_lost"));
+  const closeTransport = () => {
+    if (closed) return;
+    closed = true;
+    buffer = empty;
+    used = 0;
+    clearTimeout(deadline);
+    deadline = undefined;
+    pendingWrites.length = 0;
+    input.off("data", data);
+    input.off("end", lost);
+    input.off("close", lost);
+    input.off("error", lost);
+    // Writable emits error after invoking failed write callbacks.
+    if (writes === 0) setImmediate(() => output.off("error", lost));
+    output.off("close", lost);
+    output.off("finish", lost);
+    if (owned) {
+      input.destroy();
+      output.destroy();
+    } else input.pause();
+  };
   const data = (chunk: Buffer | string) => {
+    if (framingFailed) return;
     try {
       const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
       let start = 0;
@@ -49,18 +71,49 @@ export function lineTransport(input: Readable, output: Writable, events: Events,
         const newline = bytes.indexOf(10, start);
         const end = newline < 0 ? bytes.length : newline;
         const part = bytes.subarray(start, end);
-        if (buffer.length + part.length > MAX_PAYLOAD) throw events.error("protocol_error");
+        if (used + part.length > MAX_PAYLOAD) throw events.error("protocol_error");
         if (newline < 0) {
-          buffer = buffer.length ? Buffer.concat([buffer, part]) : Buffer.from(part);
+          if (part.length) {
+            const required = used + part.length;
+            if (required > buffer.length) {
+              const capacity = Math.min(MAX_PAYLOAD, Math.max(64, buffer.length * 2, required));
+              const grown = Buffer.allocUnsafe(capacity);
+              buffer.copy(grown, 0, 0, used);
+              buffer = grown;
+            }
+            part.copy(buffer, used);
+            used = required;
+          }
           break;
         }
-        const text = decoder.decode(buffer.length ? Buffer.concat([buffer, part]) : part);
-        buffer = empty;
+        let text: string;
+        if (used === 0) {
+          text = decoder.decode(part);
+        } else {
+          if (part.length) {
+            const required = used + part.length;
+            if (required > buffer.length) {
+              const capacity = Math.min(MAX_PAYLOAD, Math.max(64, buffer.length * 2, required));
+              const grown = Buffer.allocUnsafe(capacity);
+              buffer.copy(grown, 0, 0, used);
+              buffer = grown;
+            }
+            part.copy(buffer, used);
+            used = required;
+          }
+          text = decoder.decode(buffer.subarray(0, used));
+        }
+        used = 0;
         events.message(text);
         start = newline + 1;
       }
     } catch (reason) {
-      fail(reason instanceof Error ? reason : events.error("protocol_error"));
+      framingFailed = true;
+      buffer = empty;
+      used = 0;
+      const failure = reason instanceof Error && reason.message === "protocol_error" ? reason : events.error("protocol_error");
+      closeTransport();
+      events.fail(failure);
     }
   };
   input.on("data", data);
@@ -103,26 +156,7 @@ export function lineTransport(input: Readable, output: Writable, events: Events,
         throw reason;
       }
     },
-    close() {
-      if (closed) return;
-      closed = true;
-      buffer = empty;
-      clearTimeout(deadline);
-      deadline = undefined;
-      pendingWrites.length = 0;
-      input.off("data", data);
-      input.off("end", lost);
-      input.off("close", lost);
-      input.off("error", lost);
-      // Writable emits error after invoking failed write callbacks.
-      if (writes === 0) setImmediate(() => output.off("error", lost));
-      output.off("close", lost);
-      output.off("finish", lost);
-      if (owned) {
-        input.destroy();
-        output.destroy();
-      } else input.pause();
-    },
+    close: closeTransport,
   };
 }
 

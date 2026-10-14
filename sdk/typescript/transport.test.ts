@@ -45,6 +45,96 @@ test("line transport accepts exact payload budget and rejects larger incomplete 
   expect(failure?.message).toBe("protocol_error");
 });
 
+test("line transport assembles byte fragments and preserves empty records and frame boundaries", () => {
+  const input = new PassThrough(), output = new PassThrough();
+  const messages: string[] = [];
+  const failures: Error[] = [];
+  const transport = lineTransport(input, output, {
+    open() {}, message(text) { messages.push(text); },
+    fail(reason) { failures.push(reason); transport.close(); },
+    error(code) { return new Error(code); },
+  });
+  const bytes = Buffer.from("😀\n\n{}\n");
+  for (const byte of bytes) input.write(Buffer.from([byte]));
+  expect(messages).toEqual(["😀", "", "{}"]);
+  expect(failures).toEqual([]);
+  input.write(Buffer.from([0xff, 0x0a]));
+  input.write("{}\n");
+  expect(failures.map(error => error.message)).toEqual(["protocol_error"]);
+  expect(messages).toEqual(["😀", "", "{}"]);
+});
+
+test("fragment assembly grows geometrically with bounded copy work and reuses only initialized bytes", () => {
+  const input = Object.assign(new EventEmitter(), { pause() {} }) as unknown as PassThrough;
+  const output = new PassThrough();
+  const messages: string[] = [];
+  const capacities: number[] = [];
+  let copied = 0;
+  const originalAllocUnsafe = Buffer.allocUnsafe;
+  const originalCopy = Buffer.prototype.copy;
+  (Buffer as any).allocUnsafe = (size: number) => {
+    capacities.push(size);
+    return originalAllocUnsafe(size).fill(0x78);
+  };
+  Buffer.prototype.copy = function(this: Buffer, target: Uint8Array, targetStart?: number, sourceStart?: number, sourceEnd?: number) {
+    copied += (sourceEnd ?? this.length) - (sourceStart ?? 0);
+    return originalCopy.call(this, target, targetStart, sourceStart, sourceEnd);
+  };
+  let transport = lineTransport(input, output, {
+    open() {}, message(text) { messages.push(text); },
+    fail(reason) { throw reason; },
+    error(code) { return new Error(code); },
+  });
+  try {
+    input.emit("data", "a".repeat(100));
+    input.emit("data", "\n");
+    expect(messages).toEqual(["a".repeat(100)]);
+    input.emit("data", "y");
+    input.emit("data", "\n");
+    expect(messages.at(-1)).toBe("y");
+    transport.close();
+    transport = lineTransport(input, output, {
+      open() {}, message(text) { messages.push(text); },
+      fail(reason) { throw reason; },
+      error(code) { return new Error(code); },
+    });
+    capacities.length = 0;
+    copied = 0;
+    const byte = Buffer.from([0x61]);
+    for (let i = 0; i < MAX_PAYLOAD; i++) input.emit("data", byte);
+    input.emit("data", "\n");
+    expect(messages.at(-1)).toBe("a".repeat(MAX_PAYLOAD));
+    expect(capacities).toEqual([64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, MAX_PAYLOAD]);
+    expect(copied).toBeLessThan(2 * MAX_PAYLOAD);
+    const allocationsAfterFragmentedFrame = capacities.length;
+    const copiesAfterFragmentedFrame = copied;
+    input.emit("data", "z\n");
+    expect(messages.at(-1)).toBe("z");
+    expect(capacities).toHaveLength(allocationsAfterFragmentedFrame);
+    expect(copied).toBe(copiesAfterFragmentedFrame);
+  } finally {
+    transport.close();
+    Buffer.prototype.copy = originalCopy;
+    (Buffer as any).allocUnsafe = originalAllocUnsafe;
+  }
+});
+
+test("line framing failure closes once even when the failure callback does not close", () => {
+  const input = new PassThrough(), output = new PassThrough();
+  const failures: Error[] = [];
+  const transport = lineTransport(input, output, {
+    open() {}, message() {},
+    fail(reason) { failures.push(reason); },
+    error(code) { return new Error(code); },
+  });
+  input.write(Buffer.from([0xff, 0x0a]));
+  input.write("{}\n");
+  input.end();
+  expect(failures.map(error => error.message)).toEqual(["protocol_error"]);
+  expect(input.listenerCount("data")).toBe(0);
+  expect(() => transport.send("{}")).toThrow("connection_lost");
+});
+
 test("line transport closes a stalled writer at the bounded write deadline", async () => {
   const input = new PassThrough();
   const output = new Writable({ write(_chunk, _encoding, _callback) {} });

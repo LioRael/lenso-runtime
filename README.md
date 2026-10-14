@@ -281,15 +281,39 @@ at the server service. There is no generic management invocation bypass.
 
 The current three-transport comparison is in
 [`examples/multitransport/RUN.md`](examples/multitransport/RUN.md), with real
-pre-refactor TCP samples, three alternating original/current TCP runs and all
-small/large, serial/concurrent transport samples. Run `bun run perf:transports`
-after the release build. Every target uses the same Rust handler and payload;
+historical TCP samples and final v2 evidence: three balanced transport rounds
+and three alternating TCP pairs against `9d0ff1d0a433c18fbc3e791149e8c3f29a3b0b11`.
+Both new summaries are below 32KiB and retain all small/large,
+serial/concurrent results. Historical original bytes are recoverable
+from the Git blobs recorded in each summary; local archives live in ignored
+`.perf-artifacts/`, not the compiler cache. Run `bun scripts/transport-build.ts`
+to build and record source/binary proofs, then `bun run perf:transports` only
+after other builds and tests stop. Full raw output defaults to `.perf-artifacts/`;
+`--output examples/multitransport/<name>.json` explicitly writes a compact summary.
+New runs warm each concurrency separately and rotate target order across bounded
+repeats. They are a different methodology from the preserved historical cohort.
+Every target uses the same Rust handler and payload;
 the caller remains TCP. Source hashes, first-call/startup measurements, separate
 stream first/final/EOF times and machine load are recorded.
 
-These are non-isolated local measurements, not a transport ranking or production
-SLO. Small-message tail variation and measured microsecond-level overhead remain
-visible in the evidence. No iii or legacy ProcessAdapter performance is claimed.
+Final 1000-record, concurrency-8 results below are medians of three per-round
+statistics, not pooled request percentiles. Every target used the same validated
+Rust handler. All 18,000 unary requests and 15,000 stream chunks across both
+final cohorts passed; startup and stream timings are separate in `RUN.md`.
+
+| Target | p50 / p95 / p99 (ms) | Requests/s | Errors |
+| --- | ---: | ---: | ---: |
+| TCP | 8.596 / 9.334 / 9.829 | 921 | 0 |
+| stdio | 8.938 / 10.053 / 10.855 | 870 | 0 |
+| WebSocket | 8.701 / 9.266 / 9.470 | 911 | 0 |
+
+The separate paired current/9d TCP throughput ratio for this condition was
+0.964 [0.926, 1.017]; p99 ratio was 1.579 [0.856, 1.923], both inconclusive
+under the observed-dispersion rule. Other conditions and their classifications
+are reported in `RUN.md`, not selected as an overall gain. These are
+non-isolated Apple M2 Pro/Darwin 27 local measurements (1-minute load 4.241–5.018),
+not a transport ranking, statistical certainty, no-regression guarantee or
+production SLO. No iii or legacy ProcessAdapter performance is claimed.
 
 For the four-path source comparison, prepare Lenso's framework packages and build
 Runtime's release kernel plus the native Rust release App:

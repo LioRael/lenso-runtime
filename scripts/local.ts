@@ -26,16 +26,17 @@ export async function candidateFiles(root = runtimeRoot, native = false) {
 async function hashFile(path: string) {
   return new Bun.CryptoHasher("sha256").update(await Bun.file(path).arrayBuffer()).digest("hex");
 }
-export async function recordBinary(binary: string, compileMs: number, files?: Record<string, string>, profile = "debug") {
+export async function recordBinary(binary: string, compileMs: number, files?: Record<string, string>, profile = "debug", nativeFiles?: Record<string, string>) {
   if (profile !== "debug" && profile !== "release") throw new Error("Unknown binary build profile");
   await Bun.write(`${binary}.source.json`, JSON.stringify({
     files: files ?? await candidateFiles(), binary_sha256: await hashFile(binary), compile_ms: compileMs,
     build_profile: profile,
+    ...(nativeFiles ? { native_files: nativeFiles } : {}),
   }, null, 2) + "\n");
 }
-export async function verifyBinary(binary: string, nativeRoot?: string, expectedProfile?: string) {
+export async function verifyBinary(binary: string, nativeRoot?: string, expectedProfile?: string, sourceRoot = runtimeRoot) {
   const proof = await Bun.file(`${binary}.source.json`).json();
-  if (JSON.stringify(proof.files) !== JSON.stringify(await candidateFiles()) ||
+  if (JSON.stringify(proof.files) !== JSON.stringify(await candidateFiles(sourceRoot)) ||
       proof.binary_sha256 !== await hashFile(binary) ||
       !["debug", "release"].includes(proof.build_profile) ||
       (expectedProfile !== undefined && proof.build_profile !== expectedProfile) ||
