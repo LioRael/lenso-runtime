@@ -1,4 +1,4 @@
-import { createConnection, type Socket } from "node:net";
+import { connectTransport, MAX_PAYLOAD, type Transport, type TransportOptions } from "./transport";
 import { types } from "node:util";
 import { type Contract, validateContract, validateSchema, validateValue } from "./schema";
 export { type Contract, type Schema } from "./schema";
@@ -47,6 +47,7 @@ export type HostOptions = {
   service: string;
   instance: string;
   port?: number;
+  transport?: TransportOptions;
   contract: Contract;
   maxConcurrency?: number;
   handlers?: Record<string, Handler>;
@@ -63,6 +64,7 @@ export type ServiceStatus = {
   active_calls: number;
   max_concurrency: number;
   selected?: boolean;
+  transport?: "tcp" | "stdio" | "websocket";
 };
 export type RecentCallStatus = {
   id: string;
@@ -110,7 +112,7 @@ type Invocation = {
   stream: boolean;
   wake?: () => void;
 };
-const MAX_FRAME = 256 * 1024;
+const MAX_FRAME = MAX_PAYLOAD + 1;
 const error = (code: string) => new RuntimeError(code, code);
 function spend(budget: { remaining: number }, bytes: number): void {
   budget.remaining -= bytes;
@@ -231,15 +233,14 @@ function validateFrame(frame: Frame): void {
 
 /** One connection is one service instance. Disconnect never replays calls. */
 export class RuntimeHost {
-  private socket: Socket;
-  private buffer = Buffer.alloc(0);
-  private writes = 0;
+  private transport: Transport;
   private sequence = 0;
   private pending = new Map<string, Pending>();
   private invocations = new Map<string, Invocation>();
   private executions = 0;
   private executionsIdle?: Deferred<void>;
   private handshake = deferred<void>();
+  private closed = deferred<void>();
   private activation?: Deferred<void>;
   private activated = false;
   private phase: "welcome" | "registered" | "ready" | "active" | "closed" = "welcome";
@@ -248,42 +249,24 @@ export class RuntimeHost {
   private drainPromise?: Promise<void>;
   private accepting = true;
   private constructor(private options: HostOptions) {
-    this.socket = createConnection({ host: "127.0.0.1", port: options.port ?? 7331 });
-    this.socket.on("connect", () => {
-      try {
-        this.send({
-          type: "hello",
-          version: 1,
-          namespace: options.namespace,
-          service: options.service,
-          instance: options.instance,
-        });
-      } catch (e) {
-        this.fail(e as Error);
-      }
-    });
-    this.socket.on("data", (data) => {
-      try {
-        this.buffer = Buffer.concat([
-          this.buffer,
-          typeof data === "string" ? Buffer.from(data) : data,
-        ]);
-        let newline: number;
-        while ((newline = this.buffer.indexOf(10)) !== -1) {
-          if (newline + 1 > MAX_FRAME) throw error("protocol_error");
-          const text = new TextDecoder("utf-8", { fatal: true }).decode(
-            this.buffer.subarray(0, newline),
-          );
-          this.buffer = this.buffer.subarray(newline + 1);
-          this.receive(JSON.parse(text));
+    this.transport = connectTransport(options.transport, options.port, {
+      error,
+      fail: (reason) => this.fail(reason),
+      message: (text) => this.receive(JSON.parse(text)),
+      open: () => {
+        try {
+          this.send({
+            type: "hello",
+            version: 1,
+            namespace: options.namespace,
+            service: options.service,
+            instance: options.instance,
+          });
+        } catch (e) {
+          this.fail(e as Error);
         }
-        if (this.buffer.length >= MAX_FRAME) throw error("protocol_error");
-      } catch (e) {
-        this.fail(e instanceof Error ? e : error("protocol_error"));
-      }
+      },
     });
-    this.socket.on("error", () => this.fail(error("connection_lost")));
-    this.socket.on("close", () => this.fail(error("connection_lost")));
   }
   static async connect(options: HostOptions): Promise<RuntimeHost> {
     validateWireValue(options.contract, 0, undefined, true);
@@ -303,13 +286,7 @@ export class RuntimeHost {
   private send(frame: Frame): void {
     if (this.phase === "closed") throw error("connection_lost");
     validateWireValue(frame, 0, undefined, true);
-    const bytes = Buffer.from(JSON.stringify(frame) + "\n");
-    if (bytes.length > MAX_FRAME) throw error("invalid_input");
-    if (this.writes >= 64) throw error("overloaded");
-    this.writes++;
-    this.socket.write(bytes, () => {
-      this.writes--;
-    });
+    this.transport.send(JSON.stringify(frame));
   }
   private cancel(id: string): void {
     try {
@@ -322,8 +299,9 @@ export class RuntimeHost {
   private fail(reason: Error): void {
     if (this.phase === "closed") return;
     this.phase = "closed";
+    this.closed.resolve();
     clearInterval(this.heartbeat);
-    this.socket.destroy();
+    this.transport.close();
     this.handshake.reject(reason);
     this.activation?.reject(reason);
     this.draining?.reject(reason);
@@ -353,7 +331,9 @@ export class RuntimeHost {
         this.heartbeat = setInterval(() => {
           try {
             this.send({ type: "heartbeat" });
-          } catch {}
+          } catch (reason) {
+            this.fail(reason instanceof Error ? reason : error("connection_lost"));
+          }
         }, frame.heartbeat_ms);
         this.phase = "registered";
         this.send({
@@ -852,6 +832,10 @@ export class RuntimeHost {
     } finally {
       clearTimeout(timer);
     }
+  }
+  /** Observe session loss; the owning App decides how to clean up, never replay. */
+  whenClosed(): Promise<void> {
+    return this.closed.promise;
   }
   close(): void {
     if (this.phase === "closed") return;

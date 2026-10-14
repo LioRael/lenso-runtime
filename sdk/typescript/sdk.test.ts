@@ -33,9 +33,10 @@ const cleanup: (() => void)[] = [];
 afterEach(() => {
   for (const close of cleanup.splice(0)) close();
 });
-async function fixture(handlers: Record<string, Handler> = {}, maxConcurrency = 8, ready = true) {
+async function fixture(handlers: Record<string, Handler> = {}, maxConcurrency = 8, ready = true, transport: "tcp" | "websocket" = "tcp") {
   let peer!: Socket,
-    buffer = "";
+    buffer = "",
+    wsPeer: any;
   const frames: any[] = [];
   const waiters: { type: string; resolve(frame: any): void }[] = [];
   const server = createServer((socket) => {
@@ -46,24 +47,41 @@ async function fixture(handlers: Record<string, Handler> = {}, maxConcurrency = 
       while ((index = buffer.indexOf("\n")) >= 0) {
         const frame = JSON.parse(buffer.slice(0, index));
         buffer = buffer.slice(index + 1);
-        if (frame.type === "hello")
-          send({ type: "welcome", version: 1, generation: "1", heartbeat_ms: 20 });
-        else if (frame.type === "register") send({ type: "registered" });
-        else if (frame.type === "ready") send({ type: "ready" });
-        else if (frame.type === "heartbeat") continue;
-        else {
-          const waiter = waiters.findIndex((w) => w.type === frame.type);
-          if (waiter >= 0) waiters.splice(waiter, 1)[0]!.resolve(frame);
-          else frames.push(frame);
-        }
+        accept(frame);
       }
     });
   });
-  const send = (frame: any) => peer.write(JSON.stringify(frame) + "\n");
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const accept = (frame: any) => {
+    if (frame.type === "hello")
+      send({ type: "welcome", version: 1, generation: "1", heartbeat_ms: 20 });
+    else if (frame.type === "register") send({ type: "registered" });
+    else if (frame.type === "ready") send({ type: "ready" });
+    else if (frame.type !== "heartbeat") {
+      const waiter = waiters.findIndex((w) => w.type === frame.type);
+      if (waiter >= 0) waiters.splice(waiter, 1)[0]!.resolve(frame);
+      else frames.push(frame);
+    }
+  };
+  const raw = (text: string) => transport === "tcp" ? peer.write(text) : wsPeer.send(text);
+  const send = (frame: any) => raw(JSON.stringify(frame) + (transport === "tcp" ? "\n" : ""));
+  const websocket = transport === "websocket" ? Bun.serve({
+    hostname: "127.0.0.1",
+    port: 0,
+    fetch(request, server) {
+      if (server.upgrade(request)) return;
+      return new Response("upgrade required", { status: 400 });
+    },
+    websocket: {
+      open(socket) { wsPeer = socket; },
+      message(_socket, message) { accept(JSON.parse(String(message))); },
+    },
+  }) : undefined;
+  if (transport === "tcp")
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   cleanup.push(() => {
     peer?.destroy();
     server.close();
+    websocket?.stop(true);
   });
   const exported = {
     version: "1",
@@ -79,7 +97,8 @@ async function fixture(handlers: Record<string, Handler> = {}, maxConcurrency = 
     handlers,
     maxConcurrency,
     ready,
-    port: (server.address() as any).port,
+    port: transport === "tcp" ? (server.address() as any).port : undefined,
+    transport: websocket ? { type: "websocket", url: `ws://127.0.0.1:${websocket.port}` } : { type: "tcp" },
   });
   cleanup.push(() => host.close());
   const next = (type: string): Promise<any> => {
@@ -97,7 +116,7 @@ async function fixture(handlers: Record<string, Handler> = {}, maxConcurrency = 
       trace_id: "trace",
       caller: { namespace: "demo", service: "caller", instance: "one" },
     });
-  return { host, next, send, invoke, frames, disconnect: () => peer.destroy() };
+  return { host, next, send, raw, invoke, frames, disconnect: () => transport === "tcp" ? peer.destroy() : wsPeer.close(), halfClose: () => peer.end() };
 }
 test("promotion uses scoped operator frame and commit acknowledgement, with no retry", async () => {
   const f = await fixture();
@@ -431,8 +450,8 @@ test("generated clients validate their own response contract and cancel invalid 
   expect(await f.next("cancel")).toMatchObject({ id: streamCall.id });
 });
 // Successful cancel framing does not prove safety when the bounded writer is full.
-test("failed stream cancellation closes the connection rather than orphaning a route", async () => {
-  const f = await fixture();
+test.each(["tcp", "websocket"] as const)("%s: failed stream cancellation closes the connection rather than orphaning a route", async (transport) => {
+  const f = await fixture({}, 8, true, transport);
   const unrelated = f.host.call(target, "unary", {});
   await f.next("call");
   const client = new LogsClient(f.host, target);
@@ -440,7 +459,7 @@ test("failed stream cancellation closes the connection rather than orphaning a r
   const call = await f.next("call");
   const next = stream.next();
   await f.next("credit");
-  (f.host as unknown as { writes: number }).writes = 64;
+  (f.host as any).transport.send = () => { throw new (class extends Error { code = "overloaded"; })("overloaded"); };
   f.send({ type: "chunk", id: call.id, output: { unexpected: true } });
   await expect(next).rejects.toMatchObject({ code: "invalid_output" });
   await expect(stream.next()).rejects.toMatchObject({ code: "invalid_output" });
@@ -455,4 +474,64 @@ test("registered-only hosts can call before explicitly publishing readiness", as
   expect(await result).toEqual({ value: 1 });
   await Promise.all([f.host.activate(), f.host.activate()]);
   await f.host.activate();
+});
+
+for (const transport of ["tcp", "websocket"] as const) {
+  test(`${transport}: shared correlation, invocation, stream credits, cancellation and drain`, async () => {
+    const f = await fixture({ unary: (input) => input }, 8, false, transport);
+    const result = f.host.call(target, "unary", { value: 8 });
+    const call = await f.next("call");
+    f.send({ type: "result", id: call.id, output: { value: 9 } });
+    expect(await result).toEqual({ value: 9 });
+    await f.host.activate();
+    f.invoke("incoming", "unary");
+    expect(await f.next("result")).toMatchObject({ id: "incoming", output: { value: 1 } });
+    const stream = f.host.stream(target, "stream", {});
+    const request = await f.next("call");
+    const next = stream.next();
+    expect(await f.next("credit")).toMatchObject({ id: request.id, credits: 1 });
+    f.send({ type: "chunk", id: request.id, output: { value: 3 } });
+    expect(await next).toEqual({ done: false, value: { value: 3 } });
+    await stream.return!();
+    expect(await f.next("cancel")).toMatchObject({ id: request.id });
+    const drain = f.host.drain(100);
+    await f.next("drain");
+    f.send({ type: "drained" });
+    await drain;
+  });
+  test(`${transport}: envelope budget, oversized inbound, disconnect without replay`, async () => {
+    const f = await fixture({}, 8, true, transport);
+    await expect(f.host.call(target, "unary", "x".repeat(256 * 1024 - 1))).rejects.toMatchObject({ code: "invalid_input" });
+    const pending = f.host.call(target, "unary", {});
+    await f.next("call");
+    f.raw(" ".repeat(256 * 1024));
+    await expect(pending).rejects.toMatchObject({ code: "protocol_error" });
+    await expect(f.host.status()).rejects.toMatchObject({ code: "connection_lost" });
+    expect(f.frames.filter((frame) => frame.type === "call")).toHaveLength(0);
+    const g = await fixture({}, 8, true, transport);
+    const lost = g.host.call(target, "unary", {});
+    await g.next("call");
+    g.disconnect();
+    await expect(lost).rejects.toMatchObject({ code: "connection_lost" });
+    await expect(g.host.call(target, "unary", {})).rejects.toMatchObject({ code: "connection_lost" });
+  });
+}
+test("TCP handles split UTF-8, coalesced lines and peer half-close", async () => {
+  const f = await fixture();
+  const first = f.host.call(target, "unary", {});
+  const second = f.host.call(target, "unary", {});
+  const a = await f.next("call"), b = await f.next("call");
+  const text = JSON.stringify({ type: "result", id: a.id, output: "é" });
+  f.raw(text.slice(0, 5));
+  f.raw(text.slice(5) + "\n" + JSON.stringify({ type: "result", id: b.id, output: 2 }) + "\n");
+  expect(await first).toBe("é");
+  expect(await second).toBe(2);
+  const lost = f.host.status();
+  await f.next("status");
+  f.halfClose();
+  await expect(lost).rejects.toMatchObject({ code: "connection_lost" });
+});
+test("WebSocket accepts only literal numeric loopback without credentials or tokens", async () => {
+  for (const url of ["wss://127.0.0.1", "ws://localhost", "ws://192.168.1.1", "ws://127.1", "ws://2130706433", "ws://user@127.0.0.1", "ws://127.0.0.1?token=x", "ws://127.0.0.1/#x"])
+    await expect(RuntimeHost.connect({ namespace: "demo", service: "sdk", instance: "one", contract: { version: "1", methods: {} }, transport: { type: "websocket", url } })).rejects.toMatchObject({ code: "invalid_input" });
 });

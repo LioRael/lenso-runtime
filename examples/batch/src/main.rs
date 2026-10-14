@@ -1,5 +1,5 @@
 use runtime_sdk::{
-    BusinessError, HandlerContext, HostOptions, RuntimeError, RuntimeHost, StreamSender,
+    BusinessError, HandlerContext, HostOptions, RuntimeError, RuntimeHost, StreamSender, Transport,
 };
 use std::time::Duration;
 pub mod logs {
@@ -70,18 +70,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .aggregate(aggregate)
         .progress(progress)
         .build()?;
-    let host = RuntimeHost::connect(
+    let transport = match std::env::var("LENSO_RUNTIME_TRANSPORT").as_deref() {
+        Ok("stdio") => Transport::Stdio,
+        Ok("websocket") => Transport::WebSocket {
+            url: std::env::var("LENSO_RUNTIME_URL")?,
+        },
+        Ok("tcp") | Err(_) => Transport::Tcp,
+        Ok(value) => return Err(format!("Unsupported runtime transport: {value}").into()),
+    };
+    let host = RuntimeHost::connect_with_transport(
         HostOptions {
-            namespace: "demo".into(),
-            service: "batch".into(),
-            instance: "rust-one".into(),
+            namespace: std::env::var("LENSO_RUNTIME_NAMESPACE").unwrap_or_else(|_| "demo".into()),
+            service: std::env::var("LENSO_RUNTIME_SERVICE").unwrap_or_else(|_| "batch".into()),
+            instance: std::env::var("LENSO_RUNTIME_INSTANCE").unwrap_or_else(|_| "rust-one".into()),
             port,
             contract: serde_json::from_str(include_str!("../../contracts/logs.json"))?,
             max_concurrency: 8,
         },
         handlers,
+        transport,
     )
     .await?;
+    if let Ok(path) = std::env::var("TRANSPORT_PID_FILE") {
+        std::fs::write(path, std::process::id().to_string())?;
+    }
     eprintln!(
         "{}",
         serde_json::json!({"event":"service_ready","namespace":"demo","service":"batch","port":port})
@@ -93,10 +105,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         tokio::select! {
             result = tokio::signal::ctrl_c() => result?,
             _ = terminate.recv() => (),
+            _ = host.wait_closed() => (),
         }
     }
     #[cfg(not(unix))]
-    tokio::signal::ctrl_c().await?;
+    tokio::select! {
+        result = tokio::signal::ctrl_c() => result?,
+        _ = host.wait_closed() => (),
+    }
     let result = host.drain(5000).await;
     host.close();
     result?;

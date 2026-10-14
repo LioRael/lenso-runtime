@@ -13,11 +13,12 @@ use std::{
     time::Duration,
 };
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
     net::TcpStream,
     sync::{mpsc, oneshot, watch, Semaphore},
     time::{timeout, timeout_at, Instant},
 };
+pub use transport::diagnostics;
+use transport::{Connection, Reader, Writer};
 
 struct BoundedJson {
     bytes: Vec<u8>,
@@ -136,10 +137,24 @@ pub struct HostOptions {
     pub contract: Value,
     pub max_concurrency: usize,
 }
+/// Physical connection selection; registration and session behavior are shared.
+#[derive(Clone, Debug)]
+pub enum Transport {
+    Tcp,
+    Stdio,
+    WebSocket { url: String },
+}
 impl HostOptions {
     /// Validate local configuration without opening a connection.
     pub fn validate(&self) -> Result<(), RuntimeError> {
-        if self.port == 0 || !(1..=64).contains(&self.max_concurrency) {
+        self.validate_for_transport(&Transport::Tcp)
+    }
+
+    /// The retained port field is ignored for stdio and WebSocket connections.
+    pub fn validate_for_transport(&self, transport: &Transport) -> Result<(), RuntimeError> {
+        if (matches!(transport, Transport::Tcp) && self.port == 0)
+            || !(1..=64).contains(&self.max_concurrency)
+        {
             return Err(RuntimeError::new("invalid_input"));
         }
         protocol::validate_host_frame(&json!({
@@ -469,21 +484,52 @@ impl Drop for CallGuard {
 }
 impl RuntimeHost {
     pub async fn connect(options: HostOptions, handlers: Handlers) -> Result<Self, RuntimeError> {
+        Self::connect_with_transport(options, handlers, Transport::Tcp).await
+    }
+
+    /// Register and activate using the selected physical transport.
+    pub async fn connect_with_transport(
+        options: HostOptions,
+        handlers: Handlers,
+        transport: Transport,
+    ) -> Result<Self, RuntimeError> {
         handlers.validate(&options.contract)?;
-        let host = Self::connect_registered(options).await?;
+        let host = Self::connect_registered_with_transport(options, transport).await?;
         host.activate(handlers).await?;
         Ok(host)
     }
 
     /// Register a connection with outbound calls available, without publishing readiness.
     pub async fn connect_registered(options: HostOptions) -> Result<Self, RuntimeError> {
-        options.validate()?;
+        Self::connect_registered_with_transport(options, Transport::Tcp).await
+    }
+
+    /// Register without ready, using the same handshake and cancellation on every transport.
+    pub async fn connect_registered_with_transport(
+        options: HostOptions,
+        transport: Transport,
+    ) -> Result<Self, RuntimeError> {
+        let stdio = matches!(&transport, Transport::Stdio);
+        options.validate_for_transport(&transport)?;
         let setup = async {
-            let mut socket = TcpStream::connect(("127.0.0.1", options.port))
-                .await
-                .map_err(|_| RuntimeError::new("connection_lost"))?;
-            write_frame(&mut socket, &json!({"type":"hello","version":1,"namespace":options.namespace,"service":options.service,"instance":options.instance})).await?;
-            let welcome = read_frame(&mut socket).await?;
+            let mut connection = match transport {
+                Transport::Tcp => Connection::tcp(
+                    TcpStream::connect(("127.0.0.1", options.port))
+                        .await
+                        .map_err(|_| RuntimeError::new("connection_lost"))?,
+                ),
+                Transport::Stdio => Connection::stdio(),
+                Transport::WebSocket { url } => transport::connect_websocket(&url).await,
+            }
+            .map_err(|error| {
+                RuntimeError::new(if error.kind() == std::io::ErrorKind::InvalidInput {
+                    "invalid_input"
+                } else {
+                    "connection_lost"
+                })
+            })?;
+            write_message(&mut connection.writer, &json!({"type":"hello","version":1,"namespace":options.namespace,"service":options.service,"instance":options.instance})).await?;
+            let welcome = read_message(&mut connection.reader).await?;
             validate_kernel_frame(&welcome)?;
             if welcome["type"] != "welcome" || welcome["version"] != 1 {
                 return Err(frame_error(&welcome));
@@ -492,15 +538,15 @@ impl RuntimeHost {
                 .as_u64()
                 .filter(|n| (1..=5000).contains(n))
                 .ok_or_else(|| RuntimeError::new("protocol_error"))?;
-            write_frame(&mut socket, &json!({"type":"register","contract":options.contract,"max_concurrency":options.max_concurrency})).await?;
-            let registered = read_frame(&mut socket).await?;
+            write_message(&mut connection.writer, &json!({"type":"register","contract":options.contract,"max_concurrency":options.max_concurrency})).await?;
+            let registered = read_message(&mut connection.reader).await?;
             validate_kernel_frame(&registered)?;
             if registered["type"] != "registered" {
                 return Err(frame_error(&registered));
             }
-            Ok((socket, heartbeat_ms))
+            Ok((connection, heartbeat_ms))
         };
-        let (socket, heartbeat_ms) = timeout(Duration::from_secs(5), setup)
+        let (connection, heartbeat_ms) = timeout(Duration::from_secs(5), setup)
             .await
             .map_err(|_| RuntimeError::new("deadline_exceeded"))??;
         let (writer, mut receiver) = mpsc::channel::<Vec<u8>>(64);
@@ -521,30 +567,52 @@ impl RuntimeHost {
                 activation: None,
             }),
         });
-        let (read, mut write) = socket.into_split();
-        let mut read = BufReader::new(read);
+        let Connection {
+            reader: mut read,
+            writer: mut write,
+        } = connection;
         let writer_inner = inner.clone();
         tokio::spawn(async move {
+            let mut writing_frame = false;
             loop {
                 tokio::select! {
                     _ = writer_inner.closed.cancelled() => break,
                     bytes = receiver.recv() => {
                         let Some(bytes) = bytes else { break; };
+                        writing_frame = true;
                         tokio::select! {
                             _ = writer_inner.closed.cancelled() => break,
-                            result = write.write_all(&bytes) => if result.is_err() { writer_inner.fail(RuntimeError::new("connection_lost")); break; }
+                            result = write.send_serialized(bytes) => if result.is_err() { writer_inner.fail(RuntimeError::new("connection_lost")); break; }
                         }
+                        writing_frame = false;
                     }
                 }
             }
-            let _ = write.shutdown().await;
+            if writing_frame {
+                // Graceful WebSocket close flushes buffered writes; do not
+                // transmit more data after abandoning this send.
+                return;
+            }
+            // Closing a peer that stopped reading must not retain the session task forever.
+            let closed = timeout(Duration::from_millis(100), async {
+                // Standard-stream duplicates do not close the process's original
+                // stdout. TCP/WebSocket instead retain their existing EOF close.
+                if stdio {
+                    write.send(br#"{"type":"unregister"}"#).await?;
+                }
+                write.close().await
+            })
+            .await;
+            if !matches!(closed, Ok(Ok(()))) {
+                transport::diagnostics::emit(json!({"event":"sdk_transport_close_failed"}));
+            }
         });
         let reader_inner = inner.clone();
         tokio::spawn(async move {
             loop {
                 let result = tokio::select! {
                     _ = reader_inner.closed.cancelled() => break,
-                    result = read_frame(&mut read) => result,
+                    result = read_message(&mut read) => result,
                 };
                 match result.and_then(|frame| receive(&reader_inner, frame, &options)) {
                     Ok(()) => (),
@@ -871,6 +939,11 @@ impl RuntimeHost {
     pub fn close(&self) {
         self.inner.fail(RuntimeError::new("connection_lost"));
     }
+
+    /// Observe session loss so an owned service can clean up and exit.
+    pub async fn wait_closed(&self) {
+        self.inner.closed.cancelled().await;
+    }
 }
 pub struct ResponseStream<T> {
     guard: CallGuard,
@@ -973,29 +1046,25 @@ impl<T: DeserializeOwned> ResponseStream<T> {
         }
     }
 }
-async fn write_frame(socket: &mut TcpStream, frame: &Value) -> Result<(), RuntimeError> {
-    let bytes = bounded_frame(frame, "invalid_input")?;
-    socket
-        .write_all(&bytes)
+async fn write_message(writer: &mut Writer, frame: &Value) -> Result<(), RuntimeError> {
+    let bytes = bounded_json(frame, "invalid_input")?;
+    writer
+        .send(&bytes)
         .await
         .map_err(|_| RuntimeError::new("connection_lost"))
 }
-async fn read_frame<R: AsyncReadExt + Unpin>(read: &mut R) -> Result<Value, RuntimeError> {
-    // Bound allocation before newline, including a peer that never terminates a frame.
-    let mut bytes = Vec::new();
-    loop {
-        let byte = read
-            .read_u8()
-            .await
-            .map_err(|_| RuntimeError::new("connection_lost"))?;
-        if bytes.len() + 1 > protocol::MAX_FRAME_BYTES {
-            return Err(RuntimeError::new("protocol_error"));
-        }
-        if byte == b'\n' {
-            break;
-        }
-        bytes.push(byte);
-    }
+async fn read_message(read: &mut Reader) -> Result<Value, RuntimeError> {
+    let bytes = read
+        .recv()
+        .await
+        .map_err(|error| {
+            RuntimeError::new(if error.kind() == std::io::ErrorKind::InvalidData {
+                "protocol_error"
+            } else {
+                "connection_lost"
+            })
+        })?
+        .ok_or_else(|| RuntimeError::new("connection_lost"))?;
     serde_json::from_slice(&bytes).map_err(|_| RuntimeError::new("protocol_error"))
 }
 fn frame_error(frame: &Value) -> RuntimeError {
@@ -1280,7 +1349,113 @@ fn receive(inner: &Arc<Inner>, frame: Value, options: &HostOptions) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
+
+    async fn write_frame(socket: &mut TcpStream, frame: &Value) -> Result<(), RuntimeError> {
+        socket
+            .write_all(&bounded_frame(frame, "invalid_input")?)
+            .await
+            .map_err(|_| RuntimeError::new("connection_lost"))
+    }
+    async fn read_frame<R: AsyncReadExt + Unpin>(read: &mut R) -> Result<Value, RuntimeError> {
+        let mut bytes = Vec::new();
+        loop {
+            let byte = read
+                .read_u8()
+                .await
+                .map_err(|_| RuntimeError::new("connection_lost"))?;
+            if bytes.len() + 1 > protocol::MAX_FRAME_BYTES {
+                return Err(RuntimeError::new("protocol_error"));
+            }
+            if byte == b'\n' {
+                break;
+            }
+            bytes.push(byte);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| RuntimeError::new("protocol_error"))
+    }
+
+    #[tokio::test]
+    async fn websocket_staged_startup_calls_and_close_share_session() {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
+        let url = format!("ws://{}/", listener.local_addr().unwrap());
+        let connect = tokio::spawn(RuntimeHost::connect_registered_with_transport(
+            HostOptions {
+                namespace: "demo".into(),
+                service: "test".into(),
+                instance: "one".into(),
+                port: 7331,
+                contract: json!({"version":"1","methods":{}}),
+                max_concurrency: 8,
+            },
+            Transport::WebSocket { url },
+        ));
+        let mut peer = transport::accept_websocket(listener.accept().await.unwrap().0)
+            .await
+            .unwrap();
+        assert_eq!(
+            read_message(&mut peer.reader).await.unwrap()["type"],
+            "hello"
+        );
+        write_message(
+            &mut peer.writer,
+            &json!({"type":"welcome","version":1,"generation":"1","heartbeat_ms":1000}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            read_message(&mut peer.reader).await.unwrap()["type"],
+            "register"
+        );
+        write_message(&mut peer.writer, &json!({"type":"registered"}))
+            .await
+            .unwrap();
+        let host = connect.await.unwrap().unwrap();
+        let activate_host = host.clone();
+        let activate = tokio::spawn(async move { activate_host.activate(Handlers::new()).await });
+        loop {
+            let frame = read_message(&mut peer.reader).await.unwrap();
+            if frame["type"] == "heartbeat" {
+                continue;
+            }
+            assert_eq!(frame["type"], "ready");
+            break;
+        }
+        write_message(&mut peer.writer, &json!({"type":"ready"}))
+            .await
+            .unwrap();
+        activate.await.unwrap().unwrap();
+        let caller = host.clone();
+        let call = tokio::spawn(async move {
+            caller
+                .call::<_, Value>(&target(), "echo", json!({}), CallOptions::default())
+                .await
+        });
+        let request = loop {
+            let frame = read_message(&mut peer.reader).await.unwrap();
+            if frame["type"] != "heartbeat" {
+                break frame;
+            }
+        };
+        assert_eq!(request["type"], "call");
+        write_message(
+            &mut peer.writer,
+            &json!({"type":"result","id":request["id"],"output":42}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(call.await.unwrap().unwrap(), json!(42));
+        host.close();
+        timeout(Duration::from_secs(2), async {
+            while let Some(bytes) = peer.reader.recv().await.unwrap() {
+                let frame: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(frame["type"], "heartbeat");
+            }
+        })
+        .await
+        .unwrap();
+    }
 
     async fn fixture() -> (RuntimeHost, TcpStream) {
         fixture_with(Handlers::new(), json!({"version":"1","methods":{}})).await
@@ -1371,7 +1546,10 @@ mod tests {
     async fn assert_closed_without_ready(peer: &mut TcpStream) {
         timeout(Duration::from_secs(1), async {
             while let Ok(frame) = read_frame(peer).await {
-                assert_eq!(frame["type"], "heartbeat");
+                assert!(matches!(
+                    frame["type"].as_str(),
+                    Some("heartbeat" | "unregister")
+                ));
             }
         })
         .await

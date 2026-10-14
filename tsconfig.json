@@ -13,6 +13,7 @@
     "sdk/typescript/**/*.ts",
     "tools/**/*.ts",
     "scripts/**/*.ts",
-    "examples/generated/*.ts"
+    "examples/generated/*.ts",
+    "examples/multitransport/**/*.ts"
   ]
 }
