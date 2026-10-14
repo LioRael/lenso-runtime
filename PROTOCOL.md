@@ -1,10 +1,58 @@
 # Runtime protocol v1
 
-Transport: loopback TCP, UTF-8 newline-delimited JSON, 256 KiB maximum frame
-including newline. Bun uses `node:net`, Rust uses Tokio. All local processes are
+Transport: loopback TCP, owned child stdio, or optional loopback WebSocket.
+TCP and stdio use UTF-8 newline-delimited JSON, 256 KiB maximum frame including
+newline. WebSocket uses one JSON object per text message without a newline;
+its JSON payload budget is 256 KiB minus one byte, matching the existing envelope
+budget. Binary messages are rejected, not interpreted as an efficient data channel.
+All three use the same v1 frames and restricted contracts below.
+All local processes are
 trusted; service names are not cryptographically authenticated. No end-user
 principal is accepted or propagated. Production identity federation is absent.
 No public listener in v1.
+
+## Transport and session boundary
+
+The message transport owns framing, reading, writing and closing. The SDK session
+owns registration, correlation and handler execution. The kernel's one routing
+actor owns registration state, generations, promotion, deadlines, credits,
+admission and scheduling regardless of transport. Transport is not a plugin type.
+
+Messages are delivered in send order within each direction of one connection.
+There is no ordering guarantee across connections or concurrently executing
+business handlers. Each connection has at most 64 queued outbound messages;
+blocked writes have a bounded lifetime, not an unbounded retry buffer.
+WebSocket implementations also bound their underlying byte buffers and process
+ping/pong control frames without granting business stream credit. The TS SDK uses
+the small `ws` client with a parser-level payload limit, including fragmented
+messages, rather than checking only after a global WebSocket assembles the input.
+Rust handles control frames in its transport driver.
+Heartbeat remains a separate v1 session-level liveness mechanism.
+
+EOF (including a TCP/stdio half-close), malformed/truncated input, failed writes,
+WebSocket close or liveness expiry retire the entire session and fail its routes.
+There is no protocol half-close state. Terminal diagnostics get at most one
+100 ms flush budget on kernel close; close/flush failures are reported on stderr.
+The first terminal transition retires correlation; valid late or duplicate
+terminal frames for a retired route are ignored. A response for another active
+connection's route is a protocol error.
+
+An interrupted write is aborted without graceful WebSocket close, because that
+close could flush abandoned application bytes. Bytes already transmitted before
+abort remain an uncertain external outcome. An idle Rust stdio SDK close attempts
+bounded `unregister` delivery before resource release; Rust TCP/WebSocket retain
+their existing EOF close. Unix Rust stdio uses nonblocking
+owned fd duplicates (which share standard-stream flags); it does not retain a
+Tokio blocking stdin/stdout task. Since original process descriptors remain open,
+`unregister` retires the logical session even if the child continues running.
+If that control frame cannot be delivered after a partial/stalled write, heartbeat
+expiry bounds kernel retirement and the process owner still enforces shutdown.
+
+Reconnection requires hello/register/ready and receives a new generation.
+Neither transport nor session replays unfinished requests, writes or promotions.
+The version remains 1 and capability declarations remain the registered method
+names/modes; no transport-specific capability negotiation is introduced.
+`status.services[].transport` is additive (`tcp`, `stdio`, `websocket`).
 
 Every frame has `type`. Unknown/malformed frames close the connection.
 Handshake completes within 5 s. Call, status and promotion IDs share a strictly increasing
@@ -118,6 +166,13 @@ Streams begin with zero credit. SDK grants one on consumer `next()`. At most
 16 outstanding credits; each chunk spends one. Chunk without credit fails the
 route. Unary accepts result, stream accepts chunk/end. Terminal frames need no
 credit. Iterator `return()` cancels. No unbounded consumer buffering.
+Credit is **per data item**, not bytes. Sixteen maximum-sized encoded chunks
+represent less than 4 MiB per route of in-flight payload credit; the per-connection
+64-frame outbound queue is at most 16 MiB of encoded frames. Those budgets overlap,
+are not independent reserves, and do not include parsed JSON object overhead or
+business-owned allocations. Global call and connection limits additionally bound
+protocol-owned work; handlers must bound their own data. Progress events remain
+structured business items, not raw file bytes.
 
 Timeout does not prove side effects did not finish. Cancellation is cooperative,
 not rollback. Drain gives in-flight work bounded time. Kernel restart fails
@@ -172,3 +227,78 @@ validated binding layer; it does not define a second registry or contract.
 The 256 KiB limit also applies after adding the trusted invocation envelope and
 after translating response IDs. Requests that do not fit fail `invalid_input`,
 responses `invalid_output`, without dropping healthy peers or unrelated calls.
+
+## Owned processes and local WebSocket policy
+
+Runtime may launch persistent commands using executable + argument arrays, cwd
+and inherited environment with explicit overrides. No shell is added. Stdio
+stdout is exclusively protocol; business and SDK diagnostics must use stderr.
+Process spawn, attached/identified connection and acknowledged ready are distinct
+lifecycle events. Expected identity and bounded ready deadline are checked by
+Runtime, not by the transport. A failed initial managed startup closes the run and
+cleans up already-started children; an exit after ready fails its generation but
+does not replay or automatically restart it. Existing selection/promotion rules
+are unchanged.
+Managed identities are reserved to one generation of the configured transport;
+duplicate claims are rejected, and acknowledged ready is latched as a transition,
+not inferred by periodically sampling current routing availability. A trusted
+local TCP process can still impersonate that identity; reservation is not proof
+of PID ownership or authentication.
+
+Shutdown first stops assignment and bounds managed in-flight routes, while the
+actor continues processing completions. The process owner then signals children;
+services use their normal SDK drain/native cleanup before exiting. After the
+configured grace period the owner forces termination and awaits the direct child.
+On Unix a dedicated process group is signalled, including surviving descendants;
+descendants that deliberately escape that group are outside this boundary.
+Orphan grandchildren are reaped by the OS, not by this process. Drop is a kill
+fallback, not a substitute for awaited shutdown. Forced reap has a separate
+bounded wait. Non-Unix currently kills only the direct child and is not certified
+for orphan-free process-tree cleanup. SIGKILL/crash of Runtime itself cannot run
+graceful cleanup; it is not claimed to be a production supervisor.
+SDK `wait_closed()` / `whenClosed()` lets the owning App observe session loss.
+The Rust/Bun example starters use it to stop local resources and exit if Runtime
+dies, without reconnect/replay. A nonparticipating arbitrary command or escaped
+descendant is still not guaranteed to die after Runtime itself receives SIGKILL.
+Non-Unix Rust stdio still uses blocking Tokio standard streams, so cancellation
+and runtime teardown are not guaranteed there; this implementation is not verified
+or certified on Windows.
+
+Kernel/SDK Rust diagnostics use one process-local stderr thread and a bounded
+64-event queue (4 KiB/event). Actor delivery is nonblocking. Full/unavailable
+writers drop diagnostic events with a visible kernel `limits.diagnostic_drops`
+counter (SDK-local drops are available through `runtime_sdk::diagnostics::dropped`);
+protocol errors and process-cleanup errors still affect calls/return status.
+The diagnostic thread is not joined on shutdown, so a stalled log collector
+cannot prevent child cleanup. Last queued log lines are best-effort on process exit.
+
+WebSocket is opt-in and binds only numeric loopback. Service SDK URLs accept only
+literal loopback `ws://`, with no credentials/query/fragment; remote/WSS is rejected.
+The server rejects Origin-bearing handshakes: browser access is not supported.
+The combined TCP/WebSocket/stdio connection budget is 128, including pending
+WebSocket handshakes, which have a 5 s deadline.
+
+Remote production mode is **unsupported**, not enabled by a token placeholder.
+A future mode must define WSS/TLS termination and proxy trust, authenticated
+service identity bound to the session, per-capability authorization at routing
+and resource owners, an explicit Origin allowlist (or continued browser rejection),
+and per-principal connection/rate/byte limits before enabling non-loopback bind.
+None is implemented or claimed here; no credentials are created.
+
+## Future raw-data channels (design only)
+
+Do not change progress-item credit to bytes in v1. A future negotiated capability
+can introduce an ephemeral channel owned by the exporting service and bound to
+one route and session generation. Opening it must authorize that route's caller
+at the resource owner; a channel ID is correlation, not a bearer credential.
+Direction-specific byte credit, maximum chunk size and total in-flight byte
+budget must be checked before buffering. Cancel, deadline, session loss and drain
+close all route-owned channels without replay.
+
+Channel EOF closes that direction only; it is not function completion or success.
+The function's terminal result must account for required channel EOF/consumption,
+and terminal error must cancel remaining channels. Separate channel-error and
+truncation semantics are needed. TCP/stdio may use a separate owned endpoint;
+WebSocket binary framing is only one possible encoding after negotiation.
+This delivery implements no raw-data channels, zero-copy claim or data-channel
+performance result.

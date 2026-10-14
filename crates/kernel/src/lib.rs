@@ -1,19 +1,22 @@
 //! Bounded loopback routing kernel. Only the routing actor mutates lifecycle and calls.
-use protocol::{
-    json_equivalent, validate_contract, validate_host_frame, validate_value, MAX_FRAME_BYTES,
-};
+use protocol::{json_equivalent, validate_host_frame, MAX_FRAME_BYTES};
+use serde::Serialize;
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Instant};
+
+pub use transport::diagnostics;
+pub mod process;
+#[cfg(test)]
+mod session_tests;
 
 const CONNECTIONS: usize = 128;
 const ACTIVE: usize = 64;
@@ -27,7 +30,7 @@ enum Event {
     Gone(u64),
 }
 
-#[derive(Clone)]
+#[derive(Clone, Serialize)]
 struct Identity {
     namespace: String,
     service: String,
@@ -37,8 +40,10 @@ struct Identity {
 struct Host {
     out: mpsc::Sender<Vec<u8>>,
     _close: watch::Sender<()>,
+    transport: &'static str,
+    expected: Option<Identity>,
     identity: Option<Identity>,
-    contract: Option<Arc<Value>>,
+    contract: Option<Arc<protocol::PreparedContract>>,
     concurrency: usize,
     ready: bool,
     drain: Option<Instant>,
@@ -50,7 +55,13 @@ struct Host {
 
 struct Selection {
     generation: u64,
-    contract: Arc<Value>,
+    contract: Arc<protocol::PreparedContract>,
+}
+
+struct Reservation {
+    generation: Option<u64>,
+    transport: &'static str,
+    ready: bool,
 }
 
 struct Call {
@@ -60,8 +71,8 @@ struct Call {
     service: String,
     version: String,
     method: String,
-    contract: Arc<Value>,
-    definition: Value,
+    contract: Arc<protocol::PreparedContract>,
+    definition: Arc<protocol::PreparedMethod>,
     input: Value,
     trace: String,
     parent: Option<String>,
@@ -72,6 +83,76 @@ struct Call {
     credits: u64,
 }
 
+#[derive(Serialize)]
+struct Invocation<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    id: String,
+    method: &'a str,
+    input: &'a Value,
+    timeout_ms: u128,
+    trace_id: &'a str,
+    caller: &'a Identity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parent_id: Option<&'a str>,
+}
+
+struct EncodedFrame(Vec<u8>);
+
+fn encode(frame: &impl Serialize) -> Option<EncodedFrame> {
+    let mut bytes = serde_json::to_vec(frame).ok()?;
+    bytes.push(b'\n');
+    (bytes.len() <= MAX_FRAME_BYTES).then_some(EncodedFrame(bytes))
+}
+
+struct Candidate {
+    generation: u64,
+    namespace: String,
+    service: String,
+    version: String,
+    concurrency: usize,
+    busy: usize,
+}
+
+#[cfg(test)]
+#[derive(Default, Clone, Copy)]
+struct SchedulingWork {
+    call_visits: usize,
+    host_visits: usize,
+    candidate_visits: usize,
+}
+
+struct SchedulingSnapshot {
+    active: usize,
+    waiting: Vec<u64>,
+    candidates: Vec<Candidate>,
+    #[cfg(test)]
+    work: SchedulingWork,
+}
+
+impl SchedulingSnapshot {
+    fn available(&mut self, namespace: &str, service: &str, version: &str) -> Option<usize> {
+        if self.active >= ACTIVE {
+            return None;
+        }
+        #[cfg(test)]
+        {
+            self.work.candidate_visits += self.candidates.len();
+        }
+        self.candidates
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| {
+                h.namespace == namespace
+                    && h.service == service
+                    && h.version == version
+                    && h.busy < h.concurrency
+            })
+            .min_by_key(|(_, h)| (h.busy, h.generation))
+            .map(|(index, _)| index)
+    }
+}
+
 #[derive(Default)]
 struct Actor {
     hosts: BTreeMap<u64, Host>,
@@ -80,6 +161,10 @@ struct Actor {
     failed_writers: HashSet<u64>,
     next_route: u64,
     selections: BTreeMap<(String, String), Selection>,
+    managed_identities: BTreeMap<(String, String, String), Reservation>,
+    shutting_down: bool,
+    #[cfg(test)]
+    scheduling_work: SchedulingWork,
 }
 
 fn string(frame: &Value, key: &str) -> String {
@@ -88,19 +173,18 @@ fn string(frame: &Value, key: &str) -> String {
 
 impl Actor {
     fn send(&mut self, host: u64, frame: Value) {
-        let Ok(mut bytes) = serde_json::to_vec(&frame) else {
-            self.failed_writers.insert(host);
-            return;
-        };
-        bytes.push(b'\n');
-        if bytes.len() > MAX_FRAME_BYTES {
+        let Some(encoded) = encode(&frame) else {
             self.error(host, frame.get("id").and_then(Value::as_str), "overloaded");
             return;
-        }
+        };
+        self.enqueue(host, encoded);
+    }
+
+    fn enqueue(&mut self, host: u64, encoded: EncodedFrame) {
         if self
             .hosts
             .get(&host)
-            .is_some_and(|h| h.out.try_send(bytes).is_err())
+            .is_some_and(|h| h.out.try_send(encoded.0).is_err())
         {
             self.failed_writers.insert(host);
         }
@@ -126,27 +210,61 @@ impl Actor {
             .count()
     }
 
-    fn available(&self, namespace: &str, service: &str, version: &str) -> Option<u64> {
-        if self.calls.values().filter(|c| c.callee.is_some()).count() >= ACTIVE {
-            return None;
+    fn scheduling_snapshot(&self) -> SchedulingSnapshot {
+        let mut snapshot = SchedulingSnapshot {
+            active: 0,
+            waiting: Vec::new(),
+            candidates: Vec::new(),
+            #[cfg(test)]
+            work: SchedulingWork::default(),
+        };
+        let mut busy = HashMap::<u64, usize>::new();
+        for (route, call) in &self.calls {
+            #[cfg(test)]
+            {
+                snapshot.work.call_visits += 1;
+            }
+            if let Some(callee) = call.callee {
+                snapshot.active += 1;
+                *busy.entry(callee).or_default() += 1;
+            } else {
+                snapshot.waiting.push(*route);
+            }
         }
-        let selected = self
-            .selections
-            .get(&(namespace.to_owned(), service.to_owned()));
-        self.hosts
-            .iter()
-            .filter(|(id, h)| {
-                selected.is_none_or(|s| s.generation == **id)
-                    && h.ready
-                    && h.drain.is_none()
-                    && h.identity
-                        .as_ref()
-                        .is_some_and(|i| i.namespace == namespace && i.service == service)
-                    && h.contract.as_ref().is_some_and(|c| c["version"] == version)
-            })
-            .filter(|(id, h)| self.busy(**id) < h.concurrency)
-            .min_by_key(|(id, _)| (self.busy(**id), **id))
-            .map(|(id, _)| *id)
+        for (generation, host) in &self.hosts {
+            #[cfg(test)]
+            {
+                snapshot.work.host_visits += 1;
+            }
+            let (Some(identity), Some(contract)) = (&host.identity, &host.contract) else {
+                continue;
+            };
+            let selected = self
+                .selections
+                .get(&(identity.namespace.clone(), identity.service.clone()));
+            if !host.ready
+                || host.drain.is_some()
+                || selected.is_some_and(|s| s.generation != *generation)
+            {
+                continue;
+            }
+            snapshot.candidates.push(Candidate {
+                generation: *generation,
+                namespace: identity.namespace.clone(),
+                service: identity.service.clone(),
+                version: string(contract.original(), "version"),
+                concurrency: host.concurrency,
+                busy: busy.get(generation).copied().unwrap_or(0),
+            });
+        }
+        snapshot
+    }
+
+    fn available(&self, namespace: &str, service: &str, version: &str) -> Option<u64> {
+        let mut snapshot = self.scheduling_snapshot();
+        snapshot
+            .available(namespace, service, version)
+            .map(|index| snapshot.candidates[index].generation)
     }
 
     fn request_id(&mut self, host: u64, frame: &Value) -> bool {
@@ -170,6 +288,14 @@ impl Actor {
     }
 
     fn terminal(&mut self, route: u64, frame: Value, cancel: bool) {
+        if let Some(call) = self.retire(route, &frame, cancel) {
+            let mut frame = frame;
+            frame["id"] = json!(call.client_id);
+            self.send(call.caller, frame);
+        }
+    }
+
+    fn retire(&mut self, route: u64, frame: &Value, cancel: bool) -> Option<Call> {
         if let Some(call) = self.calls.remove(&route) {
             if self.recent.len() == 64 {
                 self.recent.pop_front();
@@ -188,9 +314,9 @@ impl Actor {
                     self.send(callee, json!({"type":"cancel","id":route.to_string()}));
                 }
             }
-            let mut frame = frame;
-            frame["id"] = json!(call.client_id);
-            self.send(call.caller, frame);
+            Some(call)
+        } else {
+            None
         }
     }
 
@@ -272,14 +398,13 @@ impl Actor {
     }
 
     fn schedule(&mut self) {
-        let waiting: Vec<_> = self
-            .calls
-            .iter()
-            .filter(|(_, c)| c.callee.is_none())
-            .map(|(id, _)| *id)
-            .collect();
+        if self.shutting_down {
+            return;
+        }
+        let mut snapshot = self.scheduling_snapshot();
+        let waiting = std::mem::take(&mut snapshot.waiting);
         for route in waiting {
-            if self.calls.values().filter(|c| c.callee.is_some()).count() >= ACTIVE {
+            if snapshot.active >= ACTIVE {
                 break;
             }
             if self
@@ -293,9 +418,14 @@ impl Actor {
             let Some(call) = self.calls.get(&route) else {
                 continue;
             };
-            let callee = self.available(&call.namespace, &call.service, &call.version);
-            if let Some(callee) = callee {
+            let candidate = snapshot.available(&call.namespace, &call.service, &call.version);
+            if let Some(index) = candidate {
+                let callee = snapshot.candidates[index].generation;
                 let Some(invoke) = self.invocation(route, call) else {
+                    continue;
+                };
+                let Some(encoded) = encode(&invoke) else {
+                    self.fail(route, "invalid_input");
                     continue;
                 };
                 let credits = call.credits;
@@ -303,7 +433,11 @@ impl Actor {
                     call.callee = Some(callee);
                     call.assigned = Some(Instant::now());
                 }
-                self.send(callee, invoke);
+                // Only waiting calls can retire in this pass; writer disconnects
+                // remain in maintenance, so successful assignments only add occupancy.
+                snapshot.active += 1;
+                snapshot.candidates[index].busy += 1;
+                self.enqueue(callee, encoded);
                 if credits > 0 {
                     self.send(
                         callee,
@@ -312,20 +446,28 @@ impl Actor {
                 }
             }
         }
+        #[cfg(test)]
+        {
+            self.scheduling_work = snapshot.work;
+        }
     }
 
-    fn invocation(&self, route: u64, call: &Call) -> Option<Value> {
+    fn invocation<'a>(&'a self, route: u64, call: &'a Call) -> Option<Invocation<'a>> {
         let identity = self.hosts.get(&call.caller)?.identity.as_ref()?;
-        let mut invoke = json!({
-            "type":"invoke","id":route.to_string(),"method":call.method,"input":call.input,
-            "timeout_ms":call.deadline.saturating_duration_since(Instant::now()).as_millis().max(1),
-            "trace_id":call.trace,
-            "caller":{"namespace":identity.namespace,"service":identity.service,"instance":identity.instance}
-        });
-        if let Some(parent) = &call.parent {
-            invoke["parent_id"] = json!(parent);
-        }
-        Some(invoke)
+        Some(Invocation {
+            kind: "invoke",
+            id: route.to_string(),
+            method: &call.method,
+            input: &call.input,
+            timeout_ms: call
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .max(1),
+            trace_id: &call.trace,
+            caller: identity,
+            parent_id: call.parent.as_deref(),
+        })
     }
 
     fn frame(&mut self, host: u64, frame: Value) {
@@ -338,17 +480,52 @@ impl Actor {
         }
         let kind = frame["type"].as_str().unwrap_or("");
         let greeted = self.hosts[&host].identity.is_some();
+        if self.shutting_down && matches!(kind, "hello" | "register" | "ready" | "call" | "promote")
+        {
+            if !greeted && kind != "hello" {
+                self.protocol_error(host);
+                return;
+            }
+            if matches!(kind, "call" | "promote") && !self.request_id(host, &frame) {
+                return;
+            }
+            self.error(host, frame.get("id").and_then(Value::as_str), "not_ready");
+            return;
+        }
         if !greeted {
             if kind != "hello" {
                 self.protocol_error(host);
                 return;
             }
+            let identity = Identity {
+                namespace: string(&frame, "namespace"),
+                service: string(&frame, "service"),
+                instance: string(&frame, "instance"),
+            };
+            if self.hosts[&host].expected.as_ref().is_some_and(|expected| {
+                expected.namespace != identity.namespace
+                    || expected.service != identity.service
+                    || expected.instance != identity.instance
+            }) {
+                self.protocol_error(host);
+                return;
+            }
+            let key = (
+                identity.namespace.clone(),
+                identity.service.clone(),
+                identity.instance.clone(),
+            );
+            if let Some(reservation) = self.managed_identities.get_mut(&key) {
+                if reservation.transport != self.hosts[&host].transport
+                    || reservation.generation.is_some_and(|owner| owner != host)
+                {
+                    self.protocol_error(host);
+                    return;
+                }
+                reservation.generation = Some(host);
+            }
             if let Some(h) = self.hosts.get_mut(&host) {
-                h.identity = Some(Identity {
-                    namespace: string(&frame, "namespace"),
-                    service: string(&frame, "service"),
-                    instance: string(&frame, "instance"),
-                });
+                h.identity = Some(identity);
                 h.seen = Instant::now();
             }
             self.send(host, json!({"type":"welcome","version":1,"generation":host.to_string(),"heartbeat_ms":1000}));
@@ -370,6 +547,13 @@ impl Actor {
                 }
                 if let Some(h) = self.hosts.get_mut(&host) {
                     h.ready = true;
+                }
+                if let Some(reservation) = self
+                    .managed_identities
+                    .values_mut()
+                    .find(|reservation| reservation.generation == Some(host))
+                {
+                    reservation.ready = true;
                 }
                 self.send(host, json!({"type":"ready"}));
             }
@@ -446,15 +630,15 @@ impl Actor {
                     .is_some_and(|i| i.namespace == namespace && i.service == service)
                 && h.contract
                     .as_ref()
-                    .is_some_and(|c| !json_equivalent(c, &contract))
+                    .is_some_and(|c| !json_equivalent(c.original(), contract.original()))
         }) || self.calls.values().any(|c| {
             c.namespace == namespace
                 && c.service == service
-                && !json_equivalent(&c.contract, &contract)
+                && !json_equivalent(c.contract.original(), contract.original())
         }) || self
             .selections
             .get(&key)
-            .is_some_and(|s| !json_equivalent(&s.contract, &contract));
+            .is_some_and(|s| !json_equivalent(s.contract.original(), contract.original()));
         if incompatible {
             self.error(operator, Some(&id), "contract_mismatch");
             return;
@@ -488,14 +672,14 @@ impl Actor {
     fn register(&mut self, host: u64, frame: &Value) {
         let h = &self.hosts[&host];
         let concurrency = frame["max_concurrency"].as_u64().unwrap_or(0);
-        if h.contract.is_some()
-            || h.drain.is_some()
-            || !(1..=64).contains(&concurrency)
-            || validate_contract(&frame["contract"]).is_err()
-        {
+        if h.contract.is_some() || h.drain.is_some() || !(1..=64).contains(&concurrency) {
             self.protocol_error(host);
             return;
         }
+        let Ok(contract) = protocol::PreparedContract::new(&frame["contract"]) else {
+            self.protocol_error(host);
+            return;
+        };
         let Some(identity) = &h.identity else {
             return;
         };
@@ -505,8 +689,8 @@ impl Actor {
                     i.namespace == identity.namespace && i.service == identity.service
                 })
                 && other.contract.as_ref().is_some_and(|c| {
-                    c["version"] == frame["contract"]["version"]
-                        && !json_equivalent(c, &frame["contract"])
+                    c.original()["version"] == frame["contract"]["version"]
+                        && !json_equivalent(c.original(), &frame["contract"])
                 })
         });
         // Queued calls retain the admitted contract even after all old instances leave.
@@ -515,14 +699,14 @@ impl Actor {
                 c.namespace == identity.namespace
                     && c.service == identity.service
                     && c.version == frame["contract"]["version"]
-                    && !json_equivalent(&c.contract, &frame["contract"])
+                    && !json_equivalent(c.contract.original(), &frame["contract"])
             })
             || self
                 .selections
                 .get(&(identity.namespace.clone(), identity.service.clone()))
                 .is_some_and(|s| {
-                    s.contract["version"] == frame["contract"]["version"]
-                        && !json_equivalent(&s.contract, &frame["contract"])
+                    s.contract.original()["version"] == frame["contract"]["version"]
+                        && !json_equivalent(s.contract.original(), &frame["contract"])
                 });
         if conflict {
             self.error(host, None, "contract_mismatch");
@@ -530,13 +714,13 @@ impl Actor {
             return;
         }
         if let Some(h) = self.hosts.get_mut(&host) {
-            h.contract = Some(Arc::new(frame["contract"].clone()));
+            h.contract = Some(Arc::new(contract));
             h.concurrency = concurrency as usize;
         }
         self.send(host, json!({"type":"registered"}));
     }
 
-    fn admit(&mut self, host: u64, frame: Value) {
+    fn admit(&mut self, host: u64, mut frame: Value) {
         let id = string(&frame, "id");
         if !self.request_id(host, &frame) {
             return;
@@ -558,9 +742,11 @@ impl Actor {
                     .is_some_and(|i| i.namespace == namespace && i.service == service)
             })
             .collect();
-        let contract = matching
-            .iter()
-            .find_map(|h| h.contract.as_ref().filter(|c| c["version"] == version));
+        let contract = matching.iter().find_map(|h| {
+            h.contract
+                .as_ref()
+                .filter(|c| c.original()["version"] == version)
+        });
         let Some(contract) = contract else {
             let code = if matching.is_empty() {
                 "service_not_found"
@@ -573,11 +759,10 @@ impl Actor {
             return;
         };
         let contract = Arc::clone(contract);
-        let definition = contract["methods"][&method].clone();
-        if definition.is_null() {
+        let Some(definition) = contract.method(&method).cloned() else {
             self.error(host, Some(&id), "contract_mismatch");
             return;
-        }
+        };
         let selected = self.selections.get(&(namespace.clone(), service.clone()));
         if !self.hosts.iter().any(|(generation, h)| {
             selected.is_none_or(|s| s.generation == *generation)
@@ -586,12 +771,14 @@ impl Actor {
                     .is_some_and(|i| i.namespace == namespace && i.service == service)
                 && h.ready
                 && h.drain.is_none()
-                && h.contract.as_ref().is_some_and(|c| c["version"] == version)
+                && h.contract
+                    .as_ref()
+                    .is_some_and(|c| c.original()["version"] == version)
         }) {
             self.error(host, Some(&id), "not_ready");
             return;
         }
-        if validate_value(&definition["input"], &frame["input"]).is_err() {
+        if definition.input().validate_value(&frame["input"]).is_err() {
             self.error(host, Some(&id), "invalid_input");
             return;
         }
@@ -621,7 +808,7 @@ impl Actor {
             method,
             contract,
             definition,
-            input: frame["input"].clone(),
+            input: frame["input"].take(),
             trace: frame
                 .get("trace_id")
                 .and_then(Value::as_str)
@@ -637,10 +824,12 @@ impl Actor {
             callee: None,
             credits: 0,
         };
+        // Admission must reject envelope overflow even while capacity is busy.
+        // Dispatch re-encodes borrowed input with the then-current remaining deadline.
         let fits = self
             .invocation(route, &call)
-            .and_then(|invoke| serde_json::to_vec(&invoke).ok())
-            .is_some_and(|bytes| bytes.len() < MAX_FRAME_BYTES);
+            .and_then(|invoke| encode(&invoke))
+            .is_some();
         if !fits {
             self.error(host, Some(&call.client_id), "invalid_input");
             return;
@@ -649,7 +838,7 @@ impl Actor {
         self.schedule();
     }
 
-    fn response(&mut self, host: u64, frame: Value) {
+    fn response(&mut self, host: u64, mut frame: Value) {
         let id = string(&frame, "id");
         let route = id.parse::<u64>().ok().filter(|r| r.to_string() == id);
         let Some(route) = route else {
@@ -669,24 +858,33 @@ impl Actor {
             return;
         }
         let kind = frame["type"].as_str().unwrap_or("");
-        let stream = call.definition["mode"] == "stream";
+        let stream = call.definition.is_stream();
         let valid = match kind {
             "result" => {
-                !stream && validate_value(&call.definition["output"], &frame["output"]).is_ok()
+                !stream
+                    && call
+                        .definition
+                        .output()
+                        .validate_value(&frame["output"])
+                        .is_ok()
             }
             "chunk" => {
                 stream
                     && call.credits > 0
-                    && validate_value(&call.definition["output"], &frame["output"]).is_ok()
+                    && call
+                        .definition
+                        .output()
+                        .validate_value(&frame["output"])
+                        .is_ok()
             }
             "end" => stream,
             "error" => {
                 frame["code"] != "business"
-                    || validate_value(
-                        &call.definition["error"],
-                        frame.get("details").unwrap_or(&Value::Null),
-                    )
-                    .is_ok()
+                    || call
+                        .definition
+                        .error()
+                        .validate_value(frame.get("details").unwrap_or(&Value::Null))
+                        .is_ok()
             }
             _ => false,
         };
@@ -699,34 +897,38 @@ impl Actor {
             self.fail(route, code);
             return;
         }
-        let mut forwarded = frame.clone();
-        forwarded["id"] = json!(call.client_id);
-        if serde_json::to_vec(&forwarded).map_or(true, |bytes| bytes.len() >= MAX_FRAME_BYTES) {
+        let chunk = kind == "chunk";
+        let infrastructure_error = kind == "error" && frame["code"] != "business";
+        let caller = call.caller;
+        frame["id"] = json!(call.client_id);
+        if infrastructure_error {
+            // Preserve overflow rejection of the original expanded envelope, even
+            // though infrastructure diagnostics are removed before transmission.
+            if encode(&frame).is_none() {
+                self.fail(route, "invalid_output");
+                return;
+            }
+            frame = json!({"type":"error","id":frame["id"],
+                "code":frame["code"],"message":frame["code"]});
+        }
+        let Some(encoded) = encode(&frame) else {
             self.fail(route, "invalid_output");
             return;
-        }
-        if kind == "chunk" {
-            let caller = call.caller;
-            let client_id = call.client_id.clone();
+        };
+        if chunk {
             if let Some(call) = self.calls.get_mut(&route) {
                 call.credits -= 1;
             }
-            let mut frame = frame;
-            frame["id"] = json!(client_id);
-            self.send(caller, frame);
         } else {
-            // Infrastructure diagnostics cannot leak host exception text or payload details.
-            let safe = if kind == "error" && frame["code"] != "business" {
-                json!({"type":"error","code":frame["code"],"message":frame["code"]})
-            } else {
-                frame
-            };
-            self.terminal(route, safe, false);
+            self.retire(route, &frame, false);
         }
+        self.enqueue(caller, encoded);
     }
 
     fn control(&mut self, host: u64, frame: Value) {
         let id = string(&frame, "id");
+        // Derive from the bounded live calls (at most ACTIVE + WAITING), so
+        // terminal cleanup cannot leave a stale caller-generation lookup.
         let route = self
             .calls
             .iter()
@@ -741,7 +943,7 @@ impl Actor {
         }
         let call = &self.calls[&route];
         let credits = frame["credits"].as_u64().unwrap_or(0);
-        if call.definition["mode"] != "stream"
+        if !call.definition.is_stream()
             || credits == 0
             || credits > 16
             || call.credits + credits > 16
@@ -763,10 +965,10 @@ impl Actor {
 
     fn status(&mut self, host: u64, frame: &Value) {
         let services: Vec<_> = self.hosts.iter().filter_map(|(id, h)| h.identity.as_ref().map(|i| json!({
-            "namespace":i.namespace,"service":i.service,"instance":i.instance,"generation":id.to_string(),
-            "contract_version":h.contract.as_ref().map(|c| &c["version"]),
+            "namespace":i.namespace,"service":i.service,"instance":i.instance,"generation":id.to_string(),"transport":h.transport,
+            "contract_version":h.contract.as_ref().map(|c| &c.original()["version"]),
             "selected":self.selections.get(&(i.namespace.clone(), i.service.clone())).is_some_and(|s| s.generation == *id),
-            "capabilities":h.contract.as_ref().and_then(|c| c["methods"].as_object()).map(|methods|
+            "capabilities":h.contract.as_ref().and_then(|c| c.original()["methods"].as_object()).map(|methods|
                 methods.iter().map(|(name, definition)| json!({"method":name,"mode":definition["mode"]})).collect::<Vec<_>>()).unwrap_or_default(),
             "state":if h.drained {"drained"} else if h.drain.is_some() {"draining"} else if h.ready {"ready"} else if h.contract.is_some() {"registered"} else {"connected"},
             "active_calls":self.busy(*id),"max_concurrency":h.concurrency
@@ -780,61 +982,97 @@ impl Actor {
         })).collect();
         self.send(host, json!({"type":"status","id":frame["id"],"services":services,"calls":calls,"recent":self.recent,
             "limits":{"connections":CONNECTIONS,"active_calls":ACTIVE,"waiting_calls":WAITING,"outbound_frames":OUTBOUND,
-            "frame_bytes":MAX_FRAME_BYTES,"deadline_ms":60000,"heartbeat_expiry_ms":5000}}));
+            "frame_bytes":MAX_FRAME_BYTES,"deadline_ms":60000,"heartbeat_expiry_ms":5000,
+            "diagnostic_drops":diagnostics::dropped()}}));
     }
 }
 
 async fn connection(
-    stream: TcpStream,
+    connection: transport::Connection,
     id: u64,
     events: mpsc::Sender<Event>,
     mut outbound: mpsc::Receiver<Vec<u8>>,
     mut closed: watch::Receiver<()>,
 ) {
-    let (mut reader, mut writer) = stream.into_split();
-    let mut buffer = Vec::with_capacity(8192);
-    let mut block = [0_u8; 8192];
-    loop {
+    let transport::Connection {
+        mut reader,
+        mut writer,
+    } = connection;
+    let mut writing_frame = false;
+    let result = loop {
+        // Arbitrate one message at a time, retaining the original TCP policy.
+        // A continuously buffered reader must not monopolize the connection.
         tokio::select! {
             biased;
-            _ = closed.changed() => break,
-            output = outbound.recv() => {
-                let Some(output) = output else { break; };
-                let written = tokio::select! {
+            _ = closed.changed() => break Ok(()),
+            bytes = outbound.recv() => {
+                let Some(bytes) = bytes else { break Ok(()); };
+                writing_frame = true;
+                let sent = tokio::select! {
                     biased;
-                    _ = closed.changed() => break,
-                    result = timeout(LIVENESS, writer.write_all(&output)) => result,
+                    _ = closed.changed() => break Ok(()),
+                    result = writer.send_serialized(bytes) => result,
                 };
-                if !matches!(written, Ok(Ok(()))) { break; }
+                if let Err(error) = sent { break Err(error); }
+                writing_frame = false;
             }
-            read = reader.read(&mut block) => {
-                let Ok(count) = read else { break; };
-                if count == 0 { break; }
-                buffer.extend_from_slice(&block[..count]);
-                while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
-                    if end + 1 > MAX_FRAME_BYTES { break; }
-                    let frame = serde_json::from_slice::<Value>(&buffer[..end]);
-                    buffer.drain(..=end);
-                    let Ok(frame) = frame else { return; };
-                    let sent = tokio::select! {
-                        biased;
-                        _ = closed.changed() => break,
-                        result = timeout(LIVENESS, events.send(Event::Frame(id, frame))) => result,
-                    };
-                    if !matches!(sent, Ok(Ok(()))) { return; }
+            received = reader.recv() => {
+                let bytes = match received {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => break Ok(()),
+                    Err(error) => break Err(error),
+                };
+                let frame = match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(frame) => frame,
+                    Err(error) => break Err(io::Error::new(io::ErrorKind::InvalidData,error)),
+                };
+                let admitted = tokio::select! {
+                    biased;
+                    _ = closed.changed() => break Ok(()),
+                    result = timeout(LIVENESS, events.send(Event::Frame(id,frame))) => result,
+                };
+                match admitted {
+                    Ok(Ok(())) => (),
+                    Ok(Err(_)) => break Err(io::Error::new(io::ErrorKind::BrokenPipe,"routing actor closed")),
+                    Err(_) => break Err(io::Error::new(io::ErrorKind::TimedOut,"session event queue stalled")),
                 }
-                if buffer.len() >= MAX_FRAME_BYTES { break; }
             }
         }
+    };
+    if let Err(error) = result {
+        diagnostics::emit(
+            json!({"event":"transport_failure","generation":id.to_string(),"error":error.to_string()}),
+        );
     }
-    // Give queued terminal diagnostics one bounded flush, not a timeout per frame.
-    let _ = timeout(Duration::from_millis(100), async {
-        while let Ok(output) = outbound.try_recv() {
-            writer.write_all(&output).await?;
+    // Retire routing before a potentially slow diagnostic flush.
+    if !matches!(
+        timeout(LIVENESS, events.send(Event::Gone(id))).await,
+        Ok(Ok(()))
+    ) {
+        diagnostics::emit(
+            json!({"event":"session_cleanup_actor_closed","generation":id.to_string()}),
+        );
+    }
+    // One total flush bound, not one timeout per queued frame.
+    if writing_frame {
+        // WebSocket graceful close may flush buffered application bytes. Abort
+        // instead after an interrupted write; its external outcome is uncertain.
+        return;
+    }
+    let flush = timeout(Duration::from_millis(100), async {
+        while let Ok(bytes) = outbound.try_recv() {
+            let diagnostic =
+                serde_json::from_slice::<Value>(&bytes).is_ok_and(|frame| frame["type"] == "error");
+            if diagnostic {
+                writer.send_serialized(bytes).await?;
+            }
         }
-        Ok::<(), io::Error>(())
+        writer.close().await
     })
     .await;
+    if !matches!(flush, Ok(Ok(()))) {
+        diagnostics::emit(json!({"event":"transport_close_failed","generation":id.to_string()}));
+    }
 }
 
 /// Serve a bound loopback listener until shutdown completes.
@@ -842,22 +1080,205 @@ async fn connection(
 /// All network tasks are joined or aborted on shutdown. Errors reject non-loopback
 /// listeners or propagate listener failures; no detached connection tasks survive.
 pub async fn serve(listener: TcpListener, shutdown: impl Future<Output = ()>) -> io::Result<()> {
-    if !listener.local_addr()?.ip().is_loopback() {
+    serve_with_transports(listener, None, Vec::new(), shutdown).await
+}
+
+struct Managed {
+    process: Option<process::ManagedProcess>,
+    config: process::ProcessConfig,
+    started: Instant,
+    generation: Option<u64>,
+    ready: bool,
+}
+
+fn attach(
+    actor: &mut Actor,
+    tasks: &mut JoinSet<()>,
+    events: &mpsc::Sender<Event>,
+    generation: &mut u64,
+    transport: transport::Connection,
+    kind: &'static str,
+    expected: Option<Identity>,
+) -> io::Result<u64> {
+    *generation = generation
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("generation exhausted"))?;
+    let id = *generation;
+    let (out, outbound) = mpsc::channel(OUTBOUND);
+    let (close, closed) = watch::channel(());
+    actor.hosts.insert(
+        id,
+        Host {
+            out,
+            _close: close,
+            transport: kind,
+            expected,
+            identity: None,
+            contract: None,
+            concurrency: 0,
+            ready: false,
+            drain: None,
+            drained: false,
+            notify_drained: false,
+            seen: Instant::now(),
+            last_id: 0,
+        },
+    );
+    let events = events.clone();
+    tasks.spawn(async move {
+        connection(transport, id, events, outbound, closed).await;
+    });
+    Ok(id)
+}
+
+/// Serve all local transports through one session/routing actor.
+/// Managed commands are persistent services, not per-request processes.
+pub async fn serve_with_transports(
+    listener: TcpListener,
+    websocket: Option<TcpListener>,
+    configs: Vec<process::ProcessConfig>,
+    shutdown: impl Future<Output = ()>,
+) -> io::Result<()> {
+    loopback_address(&listener.local_addr()?.to_string())?;
+    if let Some(listener) = &websocket {
+        loopback_address(&listener.local_addr()?.to_string())?;
+    }
+    if configs.len() > CONNECTIONS {
         return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "loopback listener required",
+            io::ErrorKind::InvalidInput,
+            "too many managed services",
         ));
+    }
+    let mut identities = HashSet::new();
+    for config in &configs {
+        config.validate()?;
+        if !identities.insert((&config.namespace, &config.service, &config.instance)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "duplicate managed process identity",
+            ));
+        }
     }
     let (events, mut incoming) = mpsc::channel(EVENTS);
     let mut tasks = JoinSet::new();
+    let mut handshakes = JoinSet::<io::Result<transport::Connection>>::new();
+    let mut cleanup = JoinSet::new();
     let mut actor = Actor::default();
+    for config in &configs {
+        actor.managed_identities.insert(
+            (
+                config.namespace.clone(),
+                config.service.clone(),
+                config.instance.clone(),
+            ),
+            Reservation {
+                generation: None,
+                transport: match config.transport {
+                    process::ProcessTransport::Stdio => "stdio",
+                    process::ProcessTransport::Tcp => "tcp",
+                },
+                ready: false,
+            },
+        );
+    }
     let mut generation = 0_u64;
+    let mut managed = Vec::<Managed>::new();
     let mut tick = tokio::time::interval(Duration::from_millis(10));
     tokio::pin!(shutdown);
-    let result = loop {
+    let startup = (|| -> io::Result<()> {
+        for mut config in configs {
+            // The actual bound TCP port also works with --listen ...:0.
+            config.env.insert(
+                "LENSO_RUNTIME_PORT".into(),
+                listener.local_addr()?.port().to_string(),
+            );
+            config
+                .env
+                .insert("LENSO_RUNTIME_NAMESPACE".into(), config.namespace.clone());
+            config
+                .env
+                .insert("LENSO_RUNTIME_SERVICE".into(), config.service.clone());
+            config
+                .env
+                .insert("LENSO_RUNTIME_INSTANCE".into(), config.instance.clone());
+            let mut child = process::spawn(&config)?;
+            diagnostics::emit(
+                json!({"event":"process_started","pid":child.pid,"service":config.service,"instance":config.instance}),
+            );
+            let id = if let Some(connection) = child.connection.take() {
+                let expected = Identity {
+                    namespace: config.namespace.clone(),
+                    service: config.service.clone(),
+                    instance: config.instance.clone(),
+                };
+                let id = attach(
+                    &mut actor,
+                    &mut tasks,
+                    &events,
+                    &mut generation,
+                    connection,
+                    "stdio",
+                    Some(expected),
+                )?;
+                diagnostics::emit(
+                    json!({"event":"process_connected","pid":child.pid,"generation":id.to_string()}),
+                );
+                Some(id)
+            } else {
+                None
+            };
+            managed.push(Managed {
+                process: Some(child),
+                config,
+                started: Instant::now(),
+                generation: id,
+                ready: false,
+            });
+        }
+        Ok(())
+    })();
+    let mut result = startup;
+    while result.is_ok() {
         tokio::select! {
-            _ = &mut shutdown => break Ok(()),
-            _ = tick.tick() => actor.maintenance(),
+            _ = &mut shutdown => break,
+            _ = tick.tick() => {
+                actor.maintenance();
+                for entry in &mut managed {
+                    let Some(child) = entry.process.as_mut() else { continue; };
+                    if entry.generation.is_none() {
+                        entry.generation = actor.managed_identities.get(&(entry.config.namespace.clone(),entry.config.service.clone(),entry.config.instance.clone())).and_then(|reservation|reservation.generation);
+                        if let Some(id) = entry.generation {
+                            diagnostics::emit(json!({"event":"process_connected","pid":child.pid,"generation":id.to_string()}));
+                        }
+                    }
+                    if entry.generation.and_then(|id|actor.hosts.get(&id)).and_then(|h|h.identity.as_ref())
+                        .is_some_and(|identity| identity.namespace != entry.config.namespace ||
+                            identity.service != entry.config.service || identity.instance != entry.config.instance) {
+                        result = Err(io::Error::new(io::ErrorKind::InvalidData,"managed service identity mismatch"));
+                        break;
+                    }
+                    if !entry.ready && actor.managed_identities.get(&(entry.config.namespace.clone(),entry.config.service.clone(),entry.config.instance.clone())).is_some_and(|reservation|reservation.ready) {
+                        entry.ready = true;
+                        diagnostics::emit(json!({"event":"process_ready","pid":child.pid,"generation":entry.generation.map(|id|id.to_string())}));
+                    }
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            diagnostics::emit(json!({"event":"process_exited","pid":child.pid,"status":status.to_string(),"was_ready":entry.ready}));
+                            if let Some(id) = entry.generation { actor.disconnect(id); }
+                            if let Some(mut child) = entry.process.take() {
+                                cleanup.spawn(async move { child.stop().await });
+                            }
+                            if !entry.ready { result = Err(io::Error::other("managed service exited before ready")); break; }
+                        }
+                        Err(error) => { result = Err(error); break; }
+                        Ok(None) if !entry.ready && entry.started.elapsed() >= Duration::from_millis(entry.config.ready_timeout_ms) => {
+                            result = Err(io::Error::new(io::ErrorKind::TimedOut, "managed service ready timeout"));
+                            break;
+                        }
+                        Ok(None) => (),
+                    }
+                }
+            },
             Some(event) = incoming.recv() => {
                 match event {
                     Event::Frame(id, frame) => actor.frame(id, frame),
@@ -865,23 +1286,90 @@ pub async fn serve(listener: TcpListener, shutdown: impl Future<Output = ()>) ->
                 }
                 actor.maintenance();
             }
-            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
-            accepted = listener.accept(), if tasks.len() < CONNECTIONS => {
-                let (stream, _) = match accepted { Ok(pair) => pair, Err(error) => break Err(error) };
-                let Some(next) = generation.checked_add(1) else { break Err(io::Error::other("generation exhausted")); };
-                generation = next;
-                let (out, outbound) = mpsc::channel(OUTBOUND);
-                let (close, closed) = watch::channel(());
-                actor.hosts.insert(generation, Host { out, _close:close, identity:None, contract:None, concurrency:0, ready:false,
-                    drain:None, drained:false, notify_drained:false, seen:Instant::now(), last_id:0 });
-                let events = events.clone();
-                tasks.spawn(async move {
-                    connection(stream, next, events.clone(), outbound, closed).await;
-                    let _ = events.send(Event::Gone(next)).await;
-                });
+            Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
+                if let Err(error) = joined { result = Err(io::Error::other(error)); }
+            }
+            Some(joined) = cleanup.join_next(), if !cleanup.is_empty() => {
+                match joined {
+                    Ok(Ok(())) => (),
+                    Ok(Err(error)) => result = Err(error),
+                    Err(error) => result = Err(io::Error::other(error)),
+                }
+            }
+            Some(joined) = handshakes.join_next(), if !handshakes.is_empty() => {
+                match joined {
+                    Ok(Ok(connection)) => {
+                        if let Err(error) = attach(&mut actor, &mut tasks, &events, &mut generation, connection, "websocket", None) {
+                            result = Err(error);
+                        }
+                    }
+                    Ok(Err(error)) => diagnostics::emit(json!({"event":"websocket_handshake_failed","error":error.to_string()})),
+                    Err(error) => result = Err(io::Error::other(error)),
+                }
+            }
+            accepted = listener.accept(), if tasks.len() + handshakes.len() < CONNECTIONS => {
+                match accepted.and_then(|(stream,_)| transport::Connection::tcp(stream)) {
+                    Ok(connection) => if let Err(error) = attach(&mut actor, &mut tasks, &events, &mut generation, connection, "tcp", None) { result = Err(error); },
+                    Err(error) => result = Err(error),
+                }
+            }
+            accepted = async { match &websocket { Some(listener) => listener.accept().await, None => std::future::pending().await } },
+                if tasks.len() + handshakes.len() < CONNECTIONS => {
+                match accepted {
+                    Ok((stream,_)) => { handshakes.spawn(async move {
+                        timeout(LIVENESS, transport::accept_websocket(stream)).await
+                            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut,"websocket handshake timeout"))?
+                    }); }
+                    Err(error) => result = Err(error),
+                }
             }
         }
-    };
+    }
+    handshakes.abort_all();
+    while handshakes.join_next().await.is_some() {}
+    actor.shutting_down = true;
+    // Keep the actor alive while assigned managed work drains. No lifecycle frame
+    // is invented: the child's normal signal handler still calls SDK drain.
+    let drain_bound = managed
+        .iter()
+        .filter(|m| m.process.is_some())
+        .map(|m| m.config.shutdown_timeout_ms)
+        .max()
+        .unwrap_or(0);
+    let deadline = Instant::now() + Duration::from_millis(drain_bound);
+    for host in actor.hosts.values_mut() {
+        host.ready = false;
+        host.drain = Some(host.drain.map_or(deadline, |old| old.min(deadline)));
+    }
+    while !actor.calls.is_empty() && Instant::now() < deadline {
+        tokio::select! {
+            _ = tick.tick() => actor.maintenance(),
+            Some(event) = incoming.recv() => match event { Event::Frame(id,frame)=>actor.frame(id,frame), Event::Gone(id)=>actor.disconnect(id) },
+        }
+    }
+    actor.maintenance();
+    let remaining: Vec<_> = actor.calls.keys().copied().collect();
+    for route in remaining {
+        actor.fail(route, "deadline_exceeded");
+    }
+    for mut entry in managed {
+        if let Some(mut child) = entry.process.take() {
+            cleanup.spawn(async move { child.stop().await });
+        }
+    }
+    while !cleanup.is_empty() {
+        tokio::select! {
+            Some(joined) = cleanup.join_next() => {
+                let failure = match joined { Ok(Ok(()))=>None, Ok(Err(error))=>Some(error), Err(error)=>Some(io::Error::other(error)) };
+                if let Some(error) = failure {
+                    diagnostics::emit(json!({"event":"process_cleanup_failed","error":error.to_string()}));
+                    if result.is_ok() { result = Err(error); }
+                }
+            }
+            Some(event) = incoming.recv() => match event { Event::Frame(id,frame)=>actor.frame(id,frame), Event::Gone(id)=>actor.disconnect(id) },
+            _ = tick.tick() => actor.maintenance(),
+        }
+    }
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     result

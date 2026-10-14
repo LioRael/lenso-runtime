@@ -30,10 +30,67 @@ target/debug/lenso-runtime --listen 127.0.0.1:7331
 LENSO_RUNTIME_PORT=7331 target/debug/logs-batch
 ```
 
-The application/dev command or process manager starts Hosts and the kernel.
-The kernel owns registration and routing state, not deployment orchestration.
+The application/dev command or process manager can still start Hosts and the kernel.
+Optionally the kernel owns a small set of persistent service commands; it does not
+replace the native App or development build/hot-replacement supervisor.
 One Host process represents one scoped Service instance. Multiple instances may
 register the same Service contract.
+
+## Mixed local transports
+
+TCP remains the SDK default. Only connection/start configuration chooses a
+transport; contracts, generated business clients and native plugin composition
+are unchanged. A single kernel routes between all connected transports.
+
+```sh
+target/debug/lenso-runtime --listen 127.0.0.1:7331 \
+  --websocket 127.0.0.1:7332 --processes services.json
+bun scripts/transport-smoke.ts
+```
+
+`--websocket` is optional. `--processes` reads a bounded JSON array, for example:
+
+```json
+[{
+  "command": "target/debug/logs-batch",
+  "args": [],
+  "namespace": "demo",
+  "service": "batch",
+  "instance": "rust-one",
+  "transport": "stdio",
+  "ready_timeout_ms": 5000,
+  "shutdown_timeout_ms": 2000
+}]
+```
+
+Commands are executed directly, not shell-joined. Relative command/cwd paths are
+relative to the launch context; use an absolute executable path when setting cwd.
+Optional `cwd` and `env` overrides are supported; environment is inherited, and
+Runtime supplies its actual TCP port and enforced transport selector. Do not put
+secrets in checked-in configuration. Environment values are not logged.
+
+TS: `RuntimeHost.connect({ ...options, transport: { type: "stdio" } })` or
+`transport: { type: "websocket", url: "ws://127.0.0.1:7332" }`.
+Rust retains the existing `HostOptions` struct and default `connect` /
+`connect_registered`; select `Transport::Stdio` or
+`Transport::WebSocket { url }` with `connect_with_transport` /
+`connect_registered_with_transport`. Native Apps should use the latter and
+activate only after their existing setup/export binding succeeds.
+
+Stdio services are **persistent child processes**, never one process per request.
+Stdout is reserved for protocol, including before ready and during cleanup:
+use `console.error` / `eprintln!` for business logs. Runtime reports process
+started, connected and ready separately and awaits shutdown/reaping.
+TCP-managed commands use the same process owner; independently launched TCP
+and WebSocket services remain caller/process-manager owned.
+See [PROTOCOL.md](PROTOCOL.md#owned-processes-and-local-websocket-policy) for
+ready failure, drain/force-close bounds and platform limitations.
+
+WebSocket is trusted local development only, with explicit loopback listeners,
+bounded JSON text messages, no newline wrapping and no raw binary channel.
+Browser Origin-bearing handshakes and remote/WSS mode are rejected.
+TLS termination, authenticated service identity and capability authorization
+remain prerequisites for any future remote production mode, not features here.
 
 ## Developer-owned code
 
@@ -194,6 +251,42 @@ at the server service. There is no generic management invocation bypass.
 
 ## Performance
 
+The current three-transport comparison is in
+[`examples/multitransport/RUN.md`](examples/multitransport/RUN.md), with real
+historical TCP samples and final v2 evidence: three balanced transport rounds
+and three alternating TCP pairs against `9d0ff1d0a433c18fbc3e791149e8c3f29a3b0b11`.
+Both new summaries are below 32KiB and retain all small/large,
+serial/concurrent results. Historical original bytes are recoverable
+from the Git blobs recorded in each summary; local archives live in ignored
+`.perf-artifacts/`, not the compiler cache. Run `bun scripts/transport-build.ts`
+to build and record source/binary proofs, then `bun run perf:transports` only
+after other builds and tests stop. Full raw output defaults to `.perf-artifacts/`;
+`--output examples/multitransport/<name>.json` explicitly writes a compact summary.
+New runs warm each concurrency separately and rotate target order across bounded
+repeats. They are a different methodology from the preserved historical cohort.
+Every target uses the same Rust handler and payload;
+the caller remains TCP. Source hashes, first-call/startup measurements, separate
+stream first/final/EOF times and machine load are recorded.
+
+Final 1000-record, concurrency-8 results below are medians of three per-round
+statistics, not pooled request percentiles. Every target used the same validated
+Rust handler. All 18,000 unary requests and 15,000 stream chunks across both
+final cohorts passed; startup and stream timings are separate in `RUN.md`.
+
+| Target | p50 / p95 / p99 (ms) | Requests/s | Errors |
+| --- | ---: | ---: | ---: |
+| TCP | 8.596 / 9.334 / 9.829 | 921 | 0 |
+| stdio | 8.938 / 10.053 / 10.855 | 870 | 0 |
+| WebSocket | 8.701 / 9.266 / 9.470 | 911 | 0 |
+
+The separate paired current/9d TCP throughput ratio for this condition was
+0.964 [0.926, 1.017]; p99 ratio was 1.579 [0.856, 1.923], both inconclusive
+under the observed-dispersion rule. Other conditions and their classifications
+are reported in `RUN.md`, not selected as an overall gain. These are
+non-isolated Apple M2 Pro/Darwin 27 local measurements (1-minute load 4.241–5.018),
+not a transport ranking, statistical certainty, no-regression guarantee or
+production SLO. No iii or legacy ProcessAdapter performance is claimed.
+
 For the three-path source comparison, prepare Lenso's framework packages and build
 Runtime's release kernel plus the native Rust release App:
 
@@ -219,7 +312,8 @@ stderr logging still contributes to remote end-to-end cost. Output equality chec
 are outside latency samples but inside throughput. No side-effectful replay or
 production data upload is performed.
 
-Observed source-checkout run: Apple M2 Pro, macOS/Darwin 27.0.0 arm64, Bun 1.4.3,
+Historical TCP-only source-checkout run before the multi-transport boundary:
+Apple M2 Pro, macOS/Darwin 27.0.0 arm64, Bun 1.4.3,
 Rust 1.101.0-nightly, optimized native binaries, no external telemetry. No other
 agent build/test was running during this sample; the machine was not isolated.
 Each path completed 1000 requests with 1000 records (60915 input bytes), concurrency

@@ -13,6 +13,8 @@ export type Schema = {
   maxItems?: number;
   anyOf?: Schema[];
 };
+// Contracts are live mutable definitions. Validation must not identity-cache,
+// freeze, or snapshot raw schemas, including generated exported contracts.
 export type Contract = {
   version: string;
   methods: Record<
@@ -200,12 +202,18 @@ export function validateValue(schema: Schema, value: unknown, depth = 0): void {
     case "string":
       if (typeof value !== "string") return fail();
       // Schema length counts Unicode scalar values, not UTF-16 code units.
-      const length = [...value].length;
-      if (
-        (schema.minLength !== undefined && length < schema.minLength) ||
-        (schema.maxLength !== undefined && length > schema.maxLength)
-      )
-        fail();
+      if (schema.minLength !== undefined || schema.maxLength !== undefined) {
+        let length = 0;
+        for (const _scalar of value) {
+          length++;
+          if (schema.maxLength !== undefined && length > schema.maxLength) fail();
+        }
+        if (
+          (schema.minLength !== undefined && length < schema.minLength) ||
+          (schema.maxLength !== undefined && length > schema.maxLength)
+        )
+          fail();
+      }
       break;
     case "array":
       if (!Array.isArray(value)) return fail();

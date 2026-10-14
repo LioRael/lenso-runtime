@@ -282,6 +282,7 @@ async fn unary_routing_rejects_forged_responses_and_reports_status() {
 async fn forwarding_overflow_rejects_only_the_call_and_preserves_the_callee() {
     let server = Server::start().await;
     let mut caller = Host::connect(server.address, &"f".repeat(256)).await;
+    let mut unrelated = Host::connect(server.address, "unrelated").await;
     let mut callee = Host::connect(server.address, "batch").await;
     let mut definition = contract("unary");
     definition["methods"]["run"]["input"] = json!({"type":"string"});
@@ -306,6 +307,12 @@ async fn forwarding_overflow_rejects_only_the_call_and_preserves_the_callee() {
         (rejected["id"].as_str(), rejected["code"].as_str()),
         (Some("2"), Some("invalid_input"))
     );
+    unrelated
+        .send(
+            json!({"type":"call","id":"1","namespace":"demo","service":"batch",
+        "method":"run","contract_version":"1","input":"healthy","timeout_ms":1000}),
+        )
+        .await;
     callee
         .send(json!({"type":"result","id":active["id"],"output":2}))
         .await;
@@ -313,37 +320,87 @@ async fn forwarding_overflow_rejects_only_the_call_and_preserves_the_callee() {
         caller.recv().await,
         json!({"type":"result","id":"1","output":2})
     );
+    let healthy = callee.recv().await;
+    assert_eq!(healthy["input"], "healthy");
+    callee
+        .send(json!({"type":"result","id":healthy["id"],"output":3}))
+        .await;
+    assert_eq!(
+        unrelated.recv().await,
+        json!({"type":"result","id":"1","output":3})
+    );
     server.finish().await;
 }
 
 #[tokio::test]
 async fn response_id_expansion_fails_only_its_route_and_keeps_both_connections() {
-    let server = Server::start().await;
-    let mut caller = Host::connect(server.address, "front").await;
-    let mut callee = Host::connect(server.address, "batch").await;
-    let mut definition = contract("unary");
-    definition["methods"]["run"]["output"] = json!({"type":"string"});
-    callee
-        .send(json!({"type":"register","max_concurrency":1,"contract":definition}))
-        .await;
-    assert_eq!(callee.recv().await["type"], "registered");
-    callee.send(json!({"type":"ready"})).await;
-    assert_eq!(callee.recv().await["type"], "ready");
-    caller.call("10000000000000000000", 1000).await;
-    let active = callee.recv().await;
-    let mut large = json!({"type":"result","id":active["id"],"output":""});
-    let payload_bytes = protocol::MAX_FRAME_BYTES - serde_json::to_vec(&large).unwrap().len() - 1;
-    large["output"] = json!("x".repeat(payload_bytes));
-    callee.send(large).await;
-    assert_eq!(caller.recv().await["code"], "invalid_output");
-    assert_eq!(callee.recv().await["type"], "cancel");
-    caller.call("10000000000000000001", 1000).await;
-    let next = callee.recv().await;
-    callee
-        .send(json!({"type":"result","id":next["id"],"output":"small"}))
-        .await;
-    assert_eq!(caller.recv().await["output"], "small");
-    server.finish().await;
+    for kind in ["result", "chunk", "business", "connection_lost"] {
+        let server = Server::start().await;
+        let mut caller = Host::connect(server.address, "front").await;
+        let mut unrelated = Host::connect(server.address, "unrelated").await;
+        let mut callee = Host::connect(server.address, "batch").await;
+        let mode = if kind == "chunk" { "stream" } else { "unary" };
+        let mut definition = contract(mode);
+        definition["methods"]["run"]["output"] = json!({"type":"string"});
+        callee
+            .send(json!({"type":"register","max_concurrency":2,"contract":definition}))
+            .await;
+        assert_eq!(callee.recv().await["type"], "registered");
+        callee.send(json!({"type":"ready"})).await;
+        assert_eq!(callee.recv().await["type"], "ready");
+        caller.call("10000000000000000000", 1000).await;
+        let active = callee.recv().await;
+        unrelated.call("1", 1000).await;
+        let healthy = callee.recv().await;
+        if kind == "chunk" {
+            caller
+                .send(json!({"type":"credit","id":"10000000000000000000","credits":1}))
+                .await;
+            assert_eq!(callee.recv().await["type"], "credit");
+        }
+        let (mut large, payload_key) = if matches!(kind, "result" | "chunk") {
+            (json!({"type":kind,"id":active["id"],"output":""}), "output")
+        } else {
+            (
+                json!({"type":"error","id":active["id"],"code":kind,
+                "message":"private exception","details":""}),
+                "details",
+            )
+        };
+        let payload_bytes =
+            protocol::MAX_FRAME_BYTES - serde_json::to_vec(&large).unwrap().len() - 1;
+        large[payload_key] = json!("x".repeat(payload_bytes));
+        assert_eq!(
+            serde_json::to_vec(&large).unwrap().len() + 1,
+            protocol::MAX_FRAME_BYTES
+        );
+        callee.send(large).await;
+        assert_eq!(
+            caller.recv().await,
+            json!({"type":"error","id":"10000000000000000000",
+            "code":"invalid_output","message":"invalid_output"})
+        );
+        assert_eq!(
+            callee.recv().await,
+            json!({"type":"cancel","id":active["id"]})
+        );
+        let terminal = if kind == "chunk" { "end" } else { "result" };
+        let mut completion = json!({"type":terminal,"id":healthy["id"]});
+        if terminal == "result" {
+            completion["output"] = json!("healthy");
+        }
+        callee.send(completion).await;
+        assert_eq!(unrelated.recv().await["type"], terminal);
+        caller.call("10000000000000000001", 1000).await;
+        let next = callee.recv().await;
+        let mut completion = json!({"type":terminal,"id":next["id"]});
+        if terminal == "result" {
+            completion["output"] = json!("small");
+        }
+        callee.send(completion).await;
+        assert_eq!(caller.recv().await["type"], terminal);
+        server.finish().await;
+    }
 }
 
 // A deadline must include time waiting for registered concurrency, not restart on dispatch.

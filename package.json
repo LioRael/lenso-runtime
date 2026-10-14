@@ -9,11 +9,13 @@
     "generate": "bun tools/generate.ts examples/contracts/logs.json examples/generated logs",
     "build:sdk": "bun run --cwd sdk/typescript build",
     "build": "bun run build:sdk && bun run generate && cargo build --workspace",
-    "test": "bun run build:sdk && cargo test --workspace && bun test sdk/typescript",
+    "test": "bun run build:sdk && cargo test --workspace && bun test ./sdk/typescript",
     "typecheck": "tsc --noEmit",
     "smoke": "bun scripts/smoke.ts",
+    "smoke:transports": "bun scripts/transport-smoke.ts",
     "verify:lenso": "bun scripts/verify-lenso.ts",
-    "perf": "bun scripts/perf.ts"
+    "perf": "bun scripts/perf.ts",
+    "perf:transports": "bun scripts/transport-perf.ts"
   },
   "dependencies": {
     "@lenso/runtime-sdk": "workspace:*"
