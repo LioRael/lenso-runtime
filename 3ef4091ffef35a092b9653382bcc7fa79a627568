@@ -1,0 +1,18 @@
+README.md
+  h_9d56aba080c170 81-87,130-150
+scripts/local.ts
+  h_9d56aba080c170 60-64,67,93-98,100,108
+scripts/smoke.ts
+  h_9d56aba080c170 26-54,70-72,223
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3ef4091ffef35a092b9653382bcc7fa79a627568",
+  "prompts": {},
+  "humans": {
+    "h_9d56aba080c170": {
+      "author": "LioRael <leo@lenso.dev>"
+    }
+  }
+}
