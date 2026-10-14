@@ -9,11 +9,15 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpListener, TcpStream};
+use tokio::net::TcpListener;
 use tokio::sync::{mpsc, watch};
 use tokio::task::JoinSet;
 use tokio::time::{timeout, Instant};
+
+pub use transport::diagnostics;
+pub mod process;
+#[cfg(test)]
+mod session_tests;
 
 const CONNECTIONS: usize = 128;
 const ACTIVE: usize = 64;
@@ -37,6 +41,8 @@ struct Identity {
 struct Host {
     out: mpsc::Sender<Vec<u8>>,
     _close: watch::Sender<()>,
+    transport: &'static str,
+    expected: Option<Identity>,
     identity: Option<Identity>,
     contract: Option<Arc<Value>>,
     concurrency: usize,
@@ -51,6 +57,12 @@ struct Host {
 struct Selection {
     generation: u64,
     contract: Arc<Value>,
+}
+
+struct Reservation {
+    generation: Option<u64>,
+    transport: &'static str,
+    ready: bool,
 }
 
 struct Call {
@@ -80,6 +92,8 @@ struct Actor {
     failed_writers: HashSet<u64>,
     next_route: u64,
     selections: BTreeMap<(String, String), Selection>,
+    managed_identities: BTreeMap<(String, String, String), Reservation>,
+    shutting_down: bool,
 }
 
 fn string(frame: &Value, key: &str) -> String {
@@ -272,6 +286,9 @@ impl Actor {
     }
 
     fn schedule(&mut self) {
+        if self.shutting_down {
+            return;
+        }
         let waiting: Vec<_> = self
             .calls
             .iter()
@@ -338,17 +355,52 @@ impl Actor {
         }
         let kind = frame["type"].as_str().unwrap_or("");
         let greeted = self.hosts[&host].identity.is_some();
+        if self.shutting_down && matches!(kind, "hello" | "register" | "ready" | "call" | "promote")
+        {
+            if !greeted && kind != "hello" {
+                self.protocol_error(host);
+                return;
+            }
+            if matches!(kind, "call" | "promote") && !self.request_id(host, &frame) {
+                return;
+            }
+            self.error(host, frame.get("id").and_then(Value::as_str), "not_ready");
+            return;
+        }
         if !greeted {
             if kind != "hello" {
                 self.protocol_error(host);
                 return;
             }
+            let identity = Identity {
+                namespace: string(&frame, "namespace"),
+                service: string(&frame, "service"),
+                instance: string(&frame, "instance"),
+            };
+            if self.hosts[&host].expected.as_ref().is_some_and(|expected| {
+                expected.namespace != identity.namespace
+                    || expected.service != identity.service
+                    || expected.instance != identity.instance
+            }) {
+                self.protocol_error(host);
+                return;
+            }
+            let key = (
+                identity.namespace.clone(),
+                identity.service.clone(),
+                identity.instance.clone(),
+            );
+            if let Some(reservation) = self.managed_identities.get_mut(&key) {
+                if reservation.transport != self.hosts[&host].transport
+                    || reservation.generation.is_some_and(|owner| owner != host)
+                {
+                    self.protocol_error(host);
+                    return;
+                }
+                reservation.generation = Some(host);
+            }
             if let Some(h) = self.hosts.get_mut(&host) {
-                h.identity = Some(Identity {
-                    namespace: string(&frame, "namespace"),
-                    service: string(&frame, "service"),
-                    instance: string(&frame, "instance"),
-                });
+                h.identity = Some(identity);
                 h.seen = Instant::now();
             }
             self.send(host, json!({"type":"welcome","version":1,"generation":host.to_string(),"heartbeat_ms":1000}));
@@ -370,6 +422,13 @@ impl Actor {
                 }
                 if let Some(h) = self.hosts.get_mut(&host) {
                     h.ready = true;
+                }
+                if let Some(reservation) = self
+                    .managed_identities
+                    .values_mut()
+                    .find(|reservation| reservation.generation == Some(host))
+                {
+                    reservation.ready = true;
                 }
                 self.send(host, json!({"type":"ready"}));
             }
@@ -763,7 +822,7 @@ impl Actor {
 
     fn status(&mut self, host: u64, frame: &Value) {
         let services: Vec<_> = self.hosts.iter().filter_map(|(id, h)| h.identity.as_ref().map(|i| json!({
-            "namespace":i.namespace,"service":i.service,"instance":i.instance,"generation":id.to_string(),
+            "namespace":i.namespace,"service":i.service,"instance":i.instance,"generation":id.to_string(),"transport":h.transport,
             "contract_version":h.contract.as_ref().map(|c| &c["version"]),
             "selected":self.selections.get(&(i.namespace.clone(), i.service.clone())).is_some_and(|s| s.generation == *id),
             "capabilities":h.contract.as_ref().and_then(|c| c["methods"].as_object()).map(|methods|
@@ -780,61 +839,97 @@ impl Actor {
         })).collect();
         self.send(host, json!({"type":"status","id":frame["id"],"services":services,"calls":calls,"recent":self.recent,
             "limits":{"connections":CONNECTIONS,"active_calls":ACTIVE,"waiting_calls":WAITING,"outbound_frames":OUTBOUND,
-            "frame_bytes":MAX_FRAME_BYTES,"deadline_ms":60000,"heartbeat_expiry_ms":5000}}));
+            "frame_bytes":MAX_FRAME_BYTES,"deadline_ms":60000,"heartbeat_expiry_ms":5000,
+            "diagnostic_drops":diagnostics::dropped()}}));
     }
 }
 
 async fn connection(
-    stream: TcpStream,
+    connection: transport::Connection,
     id: u64,
     events: mpsc::Sender<Event>,
     mut outbound: mpsc::Receiver<Vec<u8>>,
     mut closed: watch::Receiver<()>,
 ) {
-    let (mut reader, mut writer) = stream.into_split();
-    let mut buffer = Vec::with_capacity(8192);
-    let mut block = [0_u8; 8192];
-    loop {
+    let transport::Connection {
+        mut reader,
+        mut writer,
+    } = connection;
+    let mut writing_frame = false;
+    let result = loop {
+        // Arbitrate one message at a time, retaining the original TCP policy.
+        // A continuously buffered reader must not monopolize the connection.
         tokio::select! {
             biased;
-            _ = closed.changed() => break,
-            output = outbound.recv() => {
-                let Some(output) = output else { break; };
-                let written = tokio::select! {
+            _ = closed.changed() => break Ok(()),
+            bytes = outbound.recv() => {
+                let Some(bytes) = bytes else { break Ok(()); };
+                writing_frame = true;
+                let sent = tokio::select! {
                     biased;
-                    _ = closed.changed() => break,
-                    result = timeout(LIVENESS, writer.write_all(&output)) => result,
+                    _ = closed.changed() => break Ok(()),
+                    result = writer.send_serialized(bytes) => result,
                 };
-                if !matches!(written, Ok(Ok(()))) { break; }
+                if let Err(error) = sent { break Err(error); }
+                writing_frame = false;
             }
-            read = reader.read(&mut block) => {
-                let Ok(count) = read else { break; };
-                if count == 0 { break; }
-                buffer.extend_from_slice(&block[..count]);
-                while let Some(end) = buffer.iter().position(|byte| *byte == b'\n') {
-                    if end + 1 > MAX_FRAME_BYTES { break; }
-                    let frame = serde_json::from_slice::<Value>(&buffer[..end]);
-                    buffer.drain(..=end);
-                    let Ok(frame) = frame else { return; };
-                    let sent = tokio::select! {
-                        biased;
-                        _ = closed.changed() => break,
-                        result = timeout(LIVENESS, events.send(Event::Frame(id, frame))) => result,
-                    };
-                    if !matches!(sent, Ok(Ok(()))) { return; }
+            received = reader.recv() => {
+                let bytes = match received {
+                    Ok(Some(bytes)) => bytes,
+                    Ok(None) => break Ok(()),
+                    Err(error) => break Err(error),
+                };
+                let frame = match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(frame) => frame,
+                    Err(error) => break Err(io::Error::new(io::ErrorKind::InvalidData,error)),
+                };
+                let admitted = tokio::select! {
+                    biased;
+                    _ = closed.changed() => break Ok(()),
+                    result = timeout(LIVENESS, events.send(Event::Frame(id,frame))) => result,
+                };
+                match admitted {
+                    Ok(Ok(())) => (),
+                    Ok(Err(_)) => break Err(io::Error::new(io::ErrorKind::BrokenPipe,"routing actor closed")),
+                    Err(_) => break Err(io::Error::new(io::ErrorKind::TimedOut,"session event queue stalled")),
                 }
-                if buffer.len() >= MAX_FRAME_BYTES { break; }
             }
         }
+    };
+    if let Err(error) = result {
+        diagnostics::emit(
+            json!({"event":"transport_failure","generation":id.to_string(),"error":error.to_string()}),
+        );
     }
-    // Give queued terminal diagnostics one bounded flush, not a timeout per frame.
-    let _ = timeout(Duration::from_millis(100), async {
-        while let Ok(output) = outbound.try_recv() {
-            writer.write_all(&output).await?;
+    // Retire routing before a potentially slow diagnostic flush.
+    if !matches!(
+        timeout(LIVENESS, events.send(Event::Gone(id))).await,
+        Ok(Ok(()))
+    ) {
+        diagnostics::emit(
+            json!({"event":"session_cleanup_actor_closed","generation":id.to_string()}),
+        );
+    }
+    // One total flush bound, not one timeout per queued frame.
+    if writing_frame {
+        // WebSocket graceful close may flush buffered application bytes. Abort
+        // instead after an interrupted write; its external outcome is uncertain.
+        return;
+    }
+    let flush = timeout(Duration::from_millis(100), async {
+        while let Ok(bytes) = outbound.try_recv() {
+            let diagnostic =
+                serde_json::from_slice::<Value>(&bytes).is_ok_and(|frame| frame["type"] == "error");
+            if diagnostic {
+                writer.send_serialized(bytes).await?;
+            }
         }
-        Ok::<(), io::Error>(())
+        writer.close().await
     })
     .await;
+    if !matches!(flush, Ok(Ok(()))) {
+        diagnostics::emit(json!({"event":"transport_close_failed","generation":id.to_string()}));
+    }
 }
 
 /// Serve a bound loopback listener until shutdown completes.
@@ -842,22 +937,205 @@ async fn connection(
 /// All network tasks are joined or aborted on shutdown. Errors reject non-loopback
 /// listeners or propagate listener failures; no detached connection tasks survive.
 pub async fn serve(listener: TcpListener, shutdown: impl Future<Output = ()>) -> io::Result<()> {
-    if !listener.local_addr()?.ip().is_loopback() {
+    serve_with_transports(listener, None, Vec::new(), shutdown).await
+}
+
+struct Managed {
+    process: Option<process::ManagedProcess>,
+    config: process::ProcessConfig,
+    started: Instant,
+    generation: Option<u64>,
+    ready: bool,
+}
+
+fn attach(
+    actor: &mut Actor,
+    tasks: &mut JoinSet<()>,
+    events: &mpsc::Sender<Event>,
+    generation: &mut u64,
+    transport: transport::Connection,
+    kind: &'static str,
+    expected: Option<Identity>,
+) -> io::Result<u64> {
+    *generation = generation
+        .checked_add(1)
+        .ok_or_else(|| io::Error::other("generation exhausted"))?;
+    let id = *generation;
+    let (out, outbound) = mpsc::channel(OUTBOUND);
+    let (close, closed) = watch::channel(());
+    actor.hosts.insert(
+        id,
+        Host {
+            out,
+            _close: close,
+            transport: kind,
+            expected,
+            identity: None,
+            contract: None,
+            concurrency: 0,
+            ready: false,
+            drain: None,
+            drained: false,
+            notify_drained: false,
+            seen: Instant::now(),
+            last_id: 0,
+        },
+    );
+    let events = events.clone();
+    tasks.spawn(async move {
+        connection(transport, id, events, outbound, closed).await;
+    });
+    Ok(id)
+}
+
+/// Serve all local transports through one session/routing actor.
+/// Managed commands are persistent services, not per-request processes.
+pub async fn serve_with_transports(
+    listener: TcpListener,
+    websocket: Option<TcpListener>,
+    configs: Vec<process::ProcessConfig>,
+    shutdown: impl Future<Output = ()>,
+) -> io::Result<()> {
+    loopback_address(&listener.local_addr()?.to_string())?;
+    if let Some(listener) = &websocket {
+        loopback_address(&listener.local_addr()?.to_string())?;
+    }
+    if configs.len() > CONNECTIONS {
         return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "loopback listener required",
+            io::ErrorKind::InvalidInput,
+            "too many managed services",
         ));
+    }
+    let mut identities = HashSet::new();
+    for config in &configs {
+        config.validate()?;
+        if !identities.insert((&config.namespace, &config.service, &config.instance)) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "duplicate managed process identity",
+            ));
+        }
     }
     let (events, mut incoming) = mpsc::channel(EVENTS);
     let mut tasks = JoinSet::new();
+    let mut handshakes = JoinSet::<io::Result<transport::Connection>>::new();
+    let mut cleanup = JoinSet::new();
     let mut actor = Actor::default();
+    for config in &configs {
+        actor.managed_identities.insert(
+            (
+                config.namespace.clone(),
+                config.service.clone(),
+                config.instance.clone(),
+            ),
+            Reservation {
+                generation: None,
+                transport: match config.transport {
+                    process::ProcessTransport::Stdio => "stdio",
+                    process::ProcessTransport::Tcp => "tcp",
+                },
+                ready: false,
+            },
+        );
+    }
     let mut generation = 0_u64;
+    let mut managed = Vec::<Managed>::new();
     let mut tick = tokio::time::interval(Duration::from_millis(10));
     tokio::pin!(shutdown);
-    let result = loop {
+    let startup = (|| -> io::Result<()> {
+        for mut config in configs {
+            // The actual bound TCP port also works with --listen ...:0.
+            config.env.insert(
+                "LENSO_RUNTIME_PORT".into(),
+                listener.local_addr()?.port().to_string(),
+            );
+            config
+                .env
+                .insert("LENSO_RUNTIME_NAMESPACE".into(), config.namespace.clone());
+            config
+                .env
+                .insert("LENSO_RUNTIME_SERVICE".into(), config.service.clone());
+            config
+                .env
+                .insert("LENSO_RUNTIME_INSTANCE".into(), config.instance.clone());
+            let mut child = process::spawn(&config)?;
+            diagnostics::emit(
+                json!({"event":"process_started","pid":child.pid,"service":config.service,"instance":config.instance}),
+            );
+            let id = if let Some(connection) = child.connection.take() {
+                let expected = Identity {
+                    namespace: config.namespace.clone(),
+                    service: config.service.clone(),
+                    instance: config.instance.clone(),
+                };
+                let id = attach(
+                    &mut actor,
+                    &mut tasks,
+                    &events,
+                    &mut generation,
+                    connection,
+                    "stdio",
+                    Some(expected),
+                )?;
+                diagnostics::emit(
+                    json!({"event":"process_connected","pid":child.pid,"generation":id.to_string()}),
+                );
+                Some(id)
+            } else {
+                None
+            };
+            managed.push(Managed {
+                process: Some(child),
+                config,
+                started: Instant::now(),
+                generation: id,
+                ready: false,
+            });
+        }
+        Ok(())
+    })();
+    let mut result = startup;
+    while result.is_ok() {
         tokio::select! {
-            _ = &mut shutdown => break Ok(()),
-            _ = tick.tick() => actor.maintenance(),
+            _ = &mut shutdown => break,
+            _ = tick.tick() => {
+                actor.maintenance();
+                for entry in &mut managed {
+                    let Some(child) = entry.process.as_mut() else { continue; };
+                    if entry.generation.is_none() {
+                        entry.generation = actor.managed_identities.get(&(entry.config.namespace.clone(),entry.config.service.clone(),entry.config.instance.clone())).and_then(|reservation|reservation.generation);
+                        if let Some(id) = entry.generation {
+                            diagnostics::emit(json!({"event":"process_connected","pid":child.pid,"generation":id.to_string()}));
+                        }
+                    }
+                    if entry.generation.and_then(|id|actor.hosts.get(&id)).and_then(|h|h.identity.as_ref())
+                        .is_some_and(|identity| identity.namespace != entry.config.namespace ||
+                            identity.service != entry.config.service || identity.instance != entry.config.instance) {
+                        result = Err(io::Error::new(io::ErrorKind::InvalidData,"managed service identity mismatch"));
+                        break;
+                    }
+                    if !entry.ready && actor.managed_identities.get(&(entry.config.namespace.clone(),entry.config.service.clone(),entry.config.instance.clone())).is_some_and(|reservation|reservation.ready) {
+                        entry.ready = true;
+                        diagnostics::emit(json!({"event":"process_ready","pid":child.pid,"generation":entry.generation.map(|id|id.to_string())}));
+                    }
+                    match child.try_wait() {
+                        Ok(Some(status)) => {
+                            diagnostics::emit(json!({"event":"process_exited","pid":child.pid,"status":status.to_string(),"was_ready":entry.ready}));
+                            if let Some(id) = entry.generation { actor.disconnect(id); }
+                            if let Some(mut child) = entry.process.take() {
+                                cleanup.spawn(async move { child.stop().await });
+                            }
+                            if !entry.ready { result = Err(io::Error::other("managed service exited before ready")); break; }
+                        }
+                        Err(error) => { result = Err(error); break; }
+                        Ok(None) if !entry.ready && entry.started.elapsed() >= Duration::from_millis(entry.config.ready_timeout_ms) => {
+                            result = Err(io::Error::new(io::ErrorKind::TimedOut, "managed service ready timeout"));
+                            break;
+                        }
+                        Ok(None) => (),
+                    }
+                }
+            },
             Some(event) = incoming.recv() => {
                 match event {
                     Event::Frame(id, frame) => actor.frame(id, frame),
@@ -865,23 +1143,90 @@ pub async fn serve(listener: TcpListener, shutdown: impl Future<Output = ()>) ->
                 }
                 actor.maintenance();
             }
-            Some(_) = tasks.join_next(), if !tasks.is_empty() => {}
-            accepted = listener.accept(), if tasks.len() < CONNECTIONS => {
-                let (stream, _) = match accepted { Ok(pair) => pair, Err(error) => break Err(error) };
-                let Some(next) = generation.checked_add(1) else { break Err(io::Error::other("generation exhausted")); };
-                generation = next;
-                let (out, outbound) = mpsc::channel(OUTBOUND);
-                let (close, closed) = watch::channel(());
-                actor.hosts.insert(generation, Host { out, _close:close, identity:None, contract:None, concurrency:0, ready:false,
-                    drain:None, drained:false, notify_drained:false, seen:Instant::now(), last_id:0 });
-                let events = events.clone();
-                tasks.spawn(async move {
-                    connection(stream, next, events.clone(), outbound, closed).await;
-                    let _ = events.send(Event::Gone(next)).await;
-                });
+            Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
+                if let Err(error) = joined { result = Err(io::Error::other(error)); }
+            }
+            Some(joined) = cleanup.join_next(), if !cleanup.is_empty() => {
+                match joined {
+                    Ok(Ok(())) => (),
+                    Ok(Err(error)) => result = Err(error),
+                    Err(error) => result = Err(io::Error::other(error)),
+                }
+            }
+            Some(joined) = handshakes.join_next(), if !handshakes.is_empty() => {
+                match joined {
+                    Ok(Ok(connection)) => {
+                        if let Err(error) = attach(&mut actor, &mut tasks, &events, &mut generation, connection, "websocket", None) {
+                            result = Err(error);
+                        }
+                    }
+                    Ok(Err(error)) => diagnostics::emit(json!({"event":"websocket_handshake_failed","error":error.to_string()})),
+                    Err(error) => result = Err(io::Error::other(error)),
+                }
+            }
+            accepted = listener.accept(), if tasks.len() + handshakes.len() < CONNECTIONS => {
+                match accepted.and_then(|(stream,_)| transport::Connection::tcp(stream)) {
+                    Ok(connection) => if let Err(error) = attach(&mut actor, &mut tasks, &events, &mut generation, connection, "tcp", None) { result = Err(error); },
+                    Err(error) => result = Err(error),
+                }
+            }
+            accepted = async { match &websocket { Some(listener) => listener.accept().await, None => std::future::pending().await } },
+                if tasks.len() + handshakes.len() < CONNECTIONS => {
+                match accepted {
+                    Ok((stream,_)) => { handshakes.spawn(async move {
+                        timeout(LIVENESS, transport::accept_websocket(stream)).await
+                            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut,"websocket handshake timeout"))?
+                    }); }
+                    Err(error) => result = Err(error),
+                }
             }
         }
-    };
+    }
+    handshakes.abort_all();
+    while handshakes.join_next().await.is_some() {}
+    actor.shutting_down = true;
+    // Keep the actor alive while assigned managed work drains. No lifecycle frame
+    // is invented: the child's normal signal handler still calls SDK drain.
+    let drain_bound = managed
+        .iter()
+        .filter(|m| m.process.is_some())
+        .map(|m| m.config.shutdown_timeout_ms)
+        .max()
+        .unwrap_or(0);
+    let deadline = Instant::now() + Duration::from_millis(drain_bound);
+    for host in actor.hosts.values_mut() {
+        host.ready = false;
+        host.drain = Some(host.drain.map_or(deadline, |old| old.min(deadline)));
+    }
+    while !actor.calls.is_empty() && Instant::now() < deadline {
+        tokio::select! {
+            _ = tick.tick() => actor.maintenance(),
+            Some(event) = incoming.recv() => match event { Event::Frame(id,frame)=>actor.frame(id,frame), Event::Gone(id)=>actor.disconnect(id) },
+        }
+    }
+    actor.maintenance();
+    let remaining: Vec<_> = actor.calls.keys().copied().collect();
+    for route in remaining {
+        actor.fail(route, "deadline_exceeded");
+    }
+    for mut entry in managed {
+        if let Some(mut child) = entry.process.take() {
+            cleanup.spawn(async move { child.stop().await });
+        }
+    }
+    while !cleanup.is_empty() {
+        tokio::select! {
+            Some(joined) = cleanup.join_next() => {
+                let failure = match joined { Ok(Ok(()))=>None, Ok(Err(error))=>Some(error), Err(error)=>Some(io::Error::other(error)) };
+                if let Some(error) = failure {
+                    diagnostics::emit(json!({"event":"process_cleanup_failed","error":error.to_string()}));
+                    if result.is_ok() { result = Err(error); }
+                }
+            }
+            Some(event) = incoming.recv() => match event { Event::Frame(id,frame)=>actor.frame(id,frame), Event::Gone(id)=>actor.disconnect(id) },
+            _ = tick.tick() => actor.maintenance(),
+        }
+    }
     tasks.abort_all();
     while tasks.join_next().await.is_some() {}
     result
