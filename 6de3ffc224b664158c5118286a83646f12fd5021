@@ -1,0 +1,76 @@
+.gitignore
+  h_9d56aba080c170 1-3
+Cargo.lock
+  h_9d56aba080c170 1-264
+Cargo.toml
+  h_9d56aba080c170 1-15
+PROTOCOL.md
+  h_9d56aba080c170 1-97
+README.md
+  h_9d56aba080c170 1-164
+bun.lock
+  h_9d56aba080c170 1-73
+crates/kernel/Cargo.toml
+  h_9d56aba080c170 1-14
+crates/kernel/src/lib.rs
+  h_9d56aba080c170 1-784
+crates/kernel/src/main.rs
+  h_9d56aba080c170 1-35
+crates/kernel/tests/runtime.rs
+  h_9d56aba080c170 1-426
+crates/protocol/Cargo.toml
+  h_9d56aba080c170 1-9
+crates/protocol/src/lib.rs
+  h_9d56aba080c170 1-514
+crates/sdk/Cargo.toml
+  h_9d56aba080c170 1-11
+crates/sdk/src/lib.rs
+  h_9d56aba080c170 1-1468
+examples/batch/Cargo.toml
+  h_9d56aba080c170 1-10
+examples/batch/src/bin/logs-client.rs
+  h_9d56aba080c170 1-50
+examples/batch/src/main.rs
+  h_9d56aba080c170 1-141
+examples/contracts/logs.json
+  h_9d56aba080c170 1-67
+examples/generated/logs.rs
+  h_9d56aba080c170 1-78
+examples/generated/logs.ts
+  h_9d56aba080c170 1-230
+package.json
+  h_9d56aba080c170 1-25
+scripts/local.ts
+  h_9d56aba080c170 1-123
+scripts/perf.ts
+  h_9d56aba080c170 1-209
+scripts/smoke.ts
+  h_9d56aba080c170 1-196
+scripts/verify-lenso.ts
+  h_9d56aba080c170 1-202
+sdk/typescript/index.ts
+  h_9d56aba080c170 1-808
+sdk/typescript/package.json
+  h_9d56aba080c170 1-22
+sdk/typescript/schema.ts
+  h_9d56aba080c170 1-235
+sdk/typescript/sdk.test.ts
+  h_9d56aba080c170 1-391
+sdk/typescript/tsconfig.build.json
+  h_9d56aba080c170 1-12
+tools/generate.ts
+  h_9d56aba080c170 1-180
+tsconfig.json
+  h_9d56aba080c170 1-18
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "6de3ffc224b664158c5118286a83646f12fd5021",
+  "prompts": {},
+  "humans": {
+    "h_9d56aba080c170": {
+      "author": "LioRael <leo@lenso.dev>"
+    }
+  }
+}
