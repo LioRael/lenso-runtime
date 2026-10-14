@@ -148,11 +148,15 @@ the same generated contract for TS→Rust and Rust→TS calls, waits for actual
 readiness and owns its process/port cleanup. No sibling directory is discovered,
 and no missing selected App is silently replaced with the SDK-only example.
 
-From this repository, `LENSO_ROOT=../lenso bun run verify:lenso` (adjust the
-checkout-relative path) exercises actual CLI inspect/call, source-watch
-invalidation, independent Rust restart and cleanup against the prepared App.
-It changes only the source file timestamp, restoring it if the contents remain
-unchanged; no business source bytes are edited.
+From this repository, set `LENSO_ROOT` and `LENSO_RUST_ROOT` to the prepared native
+checkouts and run `bun run verify:lenso`. Build Rust's `logs-client` with its staged
+builder first. Verification uses the actual `lenso dev --workspace` CLI, inspect/call,
+duplex trace linkage, TS-only invalidation, a failing Rust build retaining the old
+instance, compatible candidate cutover, an old surviving stream, incompatible
+promotion rejection and owned-port cleanup. It copies Rust sources into an owned
+temporary test workspace before injecting failures or changing an implementation.
+Only the TS source timestamp is touched and restored if its contents remain
+unchanged; developer business source bytes are not edited.
 
 ## Execution and security
 
@@ -190,10 +194,57 @@ at the server service. There is no generic management invocation bypass.
 
 ## Performance
 
-`PERF_REQUESTS=1000 PERF_CONCURRENCY=8 bun run perf` uses release binaries, fixed
-32-record input and the same aggregation logic for native TS and separate
-TS→kernel→Rust processes. Output includes per-request p50/p95/p99, throughput,
-error rate, process RSS/CPU samples and slow-consumer stream measurements.
+For the three-path source comparison, prepare Lenso's framework packages and build
+Runtime's release kernel plus the native Rust release App:
+
+```sh
+cargo build --locked -p kernel --release
+# From lenso-rust, selecting this Runtime checkout:
+sh scripts/build-runtime.sh --runtime-root "$LENSO_RUNTIME_ROOT" --release --out target/release/logs-batch
+# From lenso-runtime, with LENSO_ROOT and LENSO_RUST_ROOT explicitly set:
+PERF_REQUESTS=1000 PERF_RECORDS=1000 PERF_CONCURRENCY=8 bun run perf
+```
+
+`perf` uses the same 1000-record bounded batch and checks every output across
+native TS, TS→kernel→TS native App, and TS→kernel→Rust native App. Both remote
+implementations use one owned kernel. Output includes per-request p50/p95/p99,
+throughput, error rate, measured business time, all process RSS/CPU samples,
+32-item slow-consumer streams and overload/settlement diagnostics. Missing
+business timings are `null`, not invented zeros. Without `LENSO_ROOT`, the
+standalone SDK comparison remains available, but remote TS is explicitly unmeasured.
+The contract caps batches at 1000; this aggregation is still cheap and transport
+cost dominates. It is **not evidence of a general Rust speed advantage**.
+Pure business timers exclude transport and Rust input conversion; their structured
+stderr logging still contributes to remote end-to-end cost. Output equality checks
+are outside latency samples but inside throughput. No side-effectful replay or
+production data upload is performed.
+
+Observed source-checkout run: Apple M2 Pro, macOS/Darwin 27.0.0 arm64, Bun 1.4.3,
+Rust 1.101.0-nightly, optimized native binaries, no external telemetry. No other
+agent build/test was running during this sample; the machine was not isolated.
+Each path completed 1000 requests with 1000 records (60915 input bytes), concurrency
+8, identical output and zero errors:
+
+| Path | Business p50 (ms) | End-to-end p50 / p95 (ms) | Requests/s |
+| --- | ---: | ---: | ---: |
+| Native TS | 0.001834 | 0.015958 / 0.037791 | 332157 |
+| Runtime → TS | 0.004875 | 8.520958 / 9.045000 | 931 |
+| Runtime → Rust | 0.013250 | 8.691875 / 9.214709 | 916 |
+
+Business telemetry contained all 1000 measured samples for each remote path.
+RSS snapshots with all processes alive: TS service 63664 KiB after its phase;
+Rust service 5168 KiB, kernel 8528 KiB and caller 60896 KiB after the Rust phase.
+These are not independent per-path peaks. A 1000-item stream completed in
+100.46 ms; 32 items consumed with 10 ms pauses took 394.12 ms. All 192 burst
+stream requests returned `overloaded`; that admission result is not a kernel
+queue-throughput measurement. Cleanup settled the Runtime registry at zero calls.
+
+The actual CLI workspace verification observed cached startup 1.78 s, TS source
+invalidation 0.37 s, failed Rust build notification 0.41 s with the old instance
+still callable, and compatible Rust rebuild/ready/cutover 1.48 s. An earlier
+cold/staging run took about 10 s to start. These are single-run feedback evidence,
+not service-level promises; Cargo cache state changes them substantially.
+
 Samples are evidence, not a mathematical memory proof; protocol bounds and
 fault tests provide the other part of that argument. Native measurements include
 an async `await` harness. CPU% from `ps` is lifetime sampling, not isolated CPU

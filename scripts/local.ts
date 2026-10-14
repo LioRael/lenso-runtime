@@ -42,10 +42,10 @@ async function waitForPort(port: number, process: Bun.Subprocess): Promise<void>
   throw new Error("Kernel did not listen within 5s");
 }
 
-export async function stopProcess(child: Bun.Subprocess): Promise<void> {
+export async function stopProcess(child: Bun.Subprocess, timeoutMs = 2000): Promise<void> {
   if (child.exitCode !== null) return;
   child.kill("SIGTERM");
-  const timer = setTimeout(() => child.kill("SIGKILL"), 2000);
+  const timer = setTimeout(() => child.kill("SIGKILL"), timeoutMs);
   try {
     await child.exited;
   } finally {
@@ -53,7 +53,13 @@ export async function stopProcess(child: Bun.Subprocess): Promise<void> {
   }
 }
 
-export async function startLocal(profile = "debug") {
+export async function startLocal(
+  profile = "debug",
+  options: {
+    batchEnv?: Record<string, string>;
+    batchStderr?: "inherit" | "pipe";
+  } = {},
+) {
   const port = await reservePort();
   const directory = resolve(import.meta.dir, "..", "target", profile);
   const kernelPath = resolve(directory, "lenso-runtime");
@@ -63,9 +69,7 @@ export async function startLocal(profile = "debug") {
   const batchPath = resolve(appDirectory, "logs-batch");
   const clientPath = resolve(appDirectory, "logs-client");
   if (!(await Bun.file(kernelPath).exists()) || !(await Bun.file(batchPath).exists())) {
-    throw new Error(
-      `Build Runtime and selected Rust binaries first: ${kernelPath}, ${batchPath}`,
-    );
+    throw new Error(`Build Runtime and selected Rust binaries first: ${kernelPath}, ${batchPath}`);
   }
   const kernel = Bun.spawn([kernelPath, "--listen", `127.0.0.1:${port}`], {
     stdout: "inherit",
@@ -76,9 +80,9 @@ export async function startLocal(profile = "debug") {
   try {
     await waitForPort(port, kernel);
     batch = Bun.spawn([batchPath], {
-      env: { ...process.env, LENSO_RUNTIME_PORT: String(port) },
+      env: { ...process.env, LENSO_RUNTIME_PORT: String(port), ...options.batchEnv },
       stdout: "inherit",
-      stderr: "inherit",
+      stderr: options.batchStderr ?? "inherit",
     });
     host = await RuntimeHost.connect({
       namespace: "demo",
@@ -90,12 +94,20 @@ export async function startLocal(profile = "debug") {
     const deadline = Date.now() + 5000;
     while (true) {
       const snapshot = await host.status();
-      if (snapshot.services.some((service) =>
-        typeof service === "object" && service !== null &&
-        "namespace" in service && service.namespace === "demo" &&
-        "service" in service && service.service === "batch" &&
-        "state" in service && service.state === "ready"
-      )) break;
+      if (
+        snapshot.services.some(
+          (service) =>
+            typeof service === "object" &&
+            service !== null &&
+            "namespace" in service &&
+            service.namespace === "demo" &&
+            "service" in service &&
+            service.service === "batch" &&
+            "state" in service &&
+            service.state === "ready",
+        )
+      )
+        break;
       if (batch.exitCode !== null) throw new Error(`Batch exited: ${batch.exitCode}`);
       if (Date.now() > deadline) throw new Error("Batch did not become ready within 5s");
       await Bun.sleep(25);
