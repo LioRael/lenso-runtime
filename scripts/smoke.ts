@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import { LogsClient, logsContract } from "../examples/generated/logs";
 import { RuntimeHost } from "@lenso/runtime-sdk";
-import { startLocal } from "./local";
+import { startLocal, verifyBinary } from "./local";
 
 const runtime = await startLocal();
 let tsService: RuntimeHost | undefined;
@@ -23,6 +23,8 @@ async function expectCode(run: () => Promise<unknown>, code: string) {
   throw new Error(`Expected ${code}`);
 }
 try {
+  assert.deepEqual(logsContract, await Bun.file(new URL("../examples/contracts/logs.json", import.meta.url)).json());
+  if (process.env.LENSO_RUST_ROOT) await verifyBinary(runtime.clientPath, process.env.LENSO_RUST_ROOT, "debug");
   tsService = await RuntimeHost.connect({
     namespace: "demo",
     service: "ts-logs",

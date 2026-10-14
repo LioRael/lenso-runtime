@@ -1,0 +1,20 @@
+name: Source checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.4.3
+      - uses: dtolnay/rust-toolchain@stable
+      - run: bun install --frozen-lockfile --ignore-scripts
+      - run: bun run build:sdk
+      - run: bun run typecheck
+      - run: bun test sdk/typescript tools scripts/local.test.ts
+      - run: cargo test --workspace --locked
+      - run: cargo build --workspace --locked
+      - run: bun run smoke

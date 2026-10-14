@@ -2,13 +2,17 @@ import { cpus, platform, release, arch } from "node:os";
 import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 import { resolve } from "node:path";
-import { LogsClient } from "../examples/generated/logs";
+import { LogsClient, logsContract } from "../examples/generated/logs";
 import { RuntimeHost } from "@lenso/runtime-sdk";
 import { emptyContract, startLocal, stopProcess } from "./local";
 
 const count = Number(process.env.PERF_REQUESTS ?? 1000);
 const recordCount = Number(process.env.PERF_RECORDS ?? 1000);
 const concurrency = Number(process.env.PERF_CONCURRENCY ?? 8);
+const warmup = 100;
+if (!process.env.LENSO_ROOT || !process.env.LENSO_RUST_ROOT)
+  throw new Error("Four-path perf requires explicit LENSO_ROOT and LENSO_RUST_ROOT; no SDK-only fallback.");
+assert.deepEqual(logsContract, await Bun.file(new URL("../examples/contracts/logs.json", import.meta.url)).json());
 if (
   !Number.isInteger(count) ||
   count < 1 ||
@@ -26,7 +30,7 @@ if (
 }
 const runtime = await startLocal("release", {
   batchStderr: "pipe",
-  batchEnv: { LENSO_PERF_TIMING: "1" },
+  batchEnv: { LENSO_PERF_TIMING: "1", LENSO_BATCH_CACHE_TTL_MS: "0" },
 });
 const client = new LogsClient(runtime.host, {
   namespace: "demo",
@@ -140,16 +144,29 @@ async function measure(run: () => unknown | Promise<unknown>) {
   return summary(samples, (performance.now() - start) / 1000, errors);
 }
 let tsProcess: Bun.Subprocess | undefined;
+let nativeApp: { stop(): Promise<void> } | undefined;
+const cold: Record<string, number> = {};
+async function first(key: string, run: () => unknown | Promise<unknown>) {
+  const before = performance.now();
+  const output = await run();
+  cold[key] = performance.now() - before;
+  assert.deepEqual(output, expected);
+}
 try {
   captureBusiness(runtime.batch, "rust");
   const root = process.env.LENSO_ROOT;
-  let nativeRun: () => unknown = nativeAggregate;
+  let nativeRun: () => unknown | Promise<unknown> = nativeAggregate;
   let remote_ts: unknown = "not measured (LENSO_ROOT unset)";
   let tsMemory: string | null = null;
   if (root) {
-    const nativeModule = await import(resolve(root, "examples/runtime/src/aggregate.ts"));
-    nativeRun = () => nativeModule.aggregate({ logs });
-    assert.deepEqual(nativeRun(), expected);
+    const bindings = await import(resolve(root, "examples/runtime/src/generated/logs.ts"));
+    assert.deepEqual(bindings.logsContract, logsContract);
+    process.env.LENSO_BATCH_CACHE_TTL_MS = "0";
+    const nativeModule = await import(resolve(root, "examples/runtime/src/batch-app.ts"));
+    const { startApp } = await import(resolve(root, "packages/lenso/dist/index.js"));
+    const running = await startApp(nativeModule.default);
+    nativeApp = running;
+    nativeRun = () => running.get(nativeModule.batch).aggregate({ logs });
     tsProcess = Bun.spawn([process.execPath, resolve(root, "examples/runtime/src/ts-batch.ts")], {
       cwd: resolve(root, "examples/runtime"),
       env: {
@@ -158,6 +175,7 @@ try {
         LENSO_RUNTIME_SERVICE: "batch-ts",
         LENSO_RUNTIME_INSTANCE: "perf-ts",
         LENSO_PERF_TIMING: "1",
+        LENSO_BATCH_CACHE_TTL_MS: "0",
       },
       stdout: "ignore",
       stderr: "pipe",
@@ -183,7 +201,7 @@ try {
       await Bun.sleep(25);
     }
     const tsClient = new LogsClient(runtime.host, { namespace: "demo", service: "batch-ts" });
-    assert.deepEqual(await tsClient.aggregate({ logs }), expected);
+    await first("runtime_ts", () => tsClient.aggregate({ logs }));
     for (let i = 0; i < 100; i++) await tsClient.aggregate({ logs });
     if (!(await collected("ts", 101)))
       throw new Error("TS warmup business telemetry is incomplete.");
@@ -192,18 +210,40 @@ try {
     await collected("ts", (remote_ts as ReturnType<typeof summary>).completed);
     tsMemory = usage();
   }
-  assert.deepEqual(await client.aggregate({ logs }), expected);
+  await first("runtime_rust", () => client.aggregate({ logs }));
   for (let i = 0; i < 100; i++) await client.aggregate({ logs });
   if (process.env.LENSO_RUST_ROOT && !(await collected("rust", 101)))
     throw new Error("Rust warmup business telemetry is incomplete.");
   businessSamples.rust.length = 0;
-  for (let i = 0; i < 100; i++) nativeRun();
-  const native = await measure(() => {
+  await first("native_ts", nativeRun);
+  for (let i = 0; i < warmup; i++) await nativeRun();
+  const native = await measure(async () => {
     const start = performance.now();
-    const output = nativeRun();
+    const output = await nativeRun();
     businessSamples.native.push(performance.now() - start);
     return output;
   });
+  const rustNative = Bun.spawn([runtime.batchPath, "--native-bench"], {
+    env: { ...process.env, LENSO_BATCH_CACHE_TTL_MS: "0", LENSO_PERF_TIMING: "0" },
+    stdin: "pipe", stdout: "pipe", stderr: "inherit",
+  });
+  rustNative.stdin.write(JSON.stringify({ logs, requests: count, concurrency, warmup }));
+  rustNative.stdin.end();
+  const nativeTimer = setTimeout(() => rustNative.kill("SIGKILL"), 120000);
+  let nativeRust;
+  try {
+    const result = await new Response(rustNative.stdout).json();
+    assert.equal(await rustNative.exited, 0);
+    assert.deepEqual(result.output, expected);
+    assert.equal(result.samplesMs.length + result.errors, count);
+    assert.ok(result.samplesMs.every((value: number) => Number.isFinite(value) && value >= 0));
+    assert.ok(Number.isFinite(result.totalMs) && result.totalMs > 0);
+    cold.native_rust = result.coldMs;
+    nativeRust = summary(result.samplesMs, result.totalMs / 1000, result.errors);
+  } finally {
+    clearTimeout(nativeTimer);
+    await stopProcess(rustNative);
+  }
   const before = usage();
   const cross_service = await measure(() => client.aggregate({ logs }));
   if (process.env.LENSO_RUST_ROOT) await collected("rust", cross_service.completed);
@@ -300,9 +340,18 @@ try {
           records: recordCount,
           concurrency,
           input_bytes: Buffer.byteLength(JSON.stringify({ logs })),
+          output_bytes: Buffer.byteLength(JSON.stringify(expected)),
+          serialization_bytes: "JSON business payload sizes; framing excluded. Native calls have no transport serialization, but all paths still encode local cache keys/values.",
+          warmup,
+          cache_ttl_ms: 0,
+          cache_note: "No stored-value hits; overlapping same-key requests may still coalesce in each native cache. This measures equal public request workload, not a fixed loader execution count.",
           observability: "no external telemetry; kernel structured stderr enabled",
         },
         native,
+        native_rust: nativeRust,
+        cold_first_operation_ms: cold,
+        compile_time_ms: runtime.compileMs,
+        compile_note: "Recorded build wall time with existing Cargo cache; separate from operation/startup latency. TS compilation unmeasured.",
         remote_ts,
         business_compute_ms: {
           native: distribution(businessSamples.native),
@@ -366,6 +415,10 @@ try {
   try {
     if (tsProcess) await stopProcess(tsProcess);
   } finally {
-    await runtime.close();
+    try {
+      await nativeApp?.stop();
+    } finally {
+      await runtime.close();
+    }
   }
 }

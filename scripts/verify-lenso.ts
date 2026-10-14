@@ -4,7 +4,7 @@ import { createServer } from "node:net";
 import { resolve } from "node:path";
 import { RuntimeHost } from "@lenso/runtime-sdk";
 import { LogsClient, logsContract } from "../examples/generated/logs";
-import { emptyContract, reservePort, stopProcess } from "./local";
+import { emptyContract, reservePort, stopProcess, verifyPrepared, verifyBinary } from "./local";
 
 const lensoRoot = process.env.LENSO_ROOT;
 if (!lensoRoot) throw new Error("Set LENSO_ROOT to the prepared Lenso checkout.");
@@ -12,6 +12,10 @@ const root = resolve(lensoRoot);
 const runtimeRoot = resolve(import.meta.dir, "..");
 const rustRoot = process.env.LENSO_RUST_ROOT;
 if (!rustRoot) throw new Error("Set LENSO_RUST_ROOT to the native Rust application checkout.");
+await verifyPrepared(root);
+await verifyBinary(resolve(runtimeRoot, "target/debug/lenso-runtime"), undefined, "debug");
+await verifyBinary(resolve(rustRoot, "target/debug/logs-client"), rustRoot, "debug");
+assert.deepEqual(logsContract, await Bun.file(resolve(runtimeRoot, "examples/contracts/logs.json")).json());
 await mkdir(resolve(runtimeRoot, "target"), { recursive: true });
 const fixture = await mkdtemp(resolve(runtimeRoot, "target/workspace-verification-"));
 try {
@@ -135,6 +139,8 @@ try {
       }
     });
     feedback.startup_ms = performance.now() - startup;
+    await verifyPrepared(root);
+    await verifyBinary(resolve(fixture, "target/debug/logs-batch"), fixture, "debug");
     assert.ok(host);
     const generation = async (service: string) => {
       const snapshot = await host!.status();

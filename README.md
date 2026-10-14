@@ -13,8 +13,6 @@ bun install
 bun run build
 bun run test
 bun run smoke
-cargo build --workspace --release
-bun run perf
 ```
 
 `smoke` starts and stops its own loopback kernel and Rust service on an available
@@ -96,8 +94,9 @@ The companion `lenso` repository already contains `packages/runtime` and
 `examples/runtime` for Core Plugin/Manage/Engine integration. The `lenso-console`
 repository contains `packages/console-runtime`, the optional read-only page.
 These remain separately owned repositories, not source copied into this one.
-The standalone build, tests, smoke example and performance entry above need
-only this repository. `@lenso/runtime-sdk` is an ordinary package, but the
+The standalone build, tests and smoke example above need only this repository.
+The four-path performance entry below requires explicitly selected companion
+workspaces. `@lenso/runtime-sdk` is an ordinary package, but the
 checkout-local SDK and adapter version strings do not imply npm publication.
 Use `startRuntimeApp` for a serving App: it binds native exports after Core setup,
 then publishes readiness, and pre-drains before Core cleanup. Plain `startApp`
@@ -126,6 +125,35 @@ claiming they are the checksum-pinned remote snapshot. The default command
 continues to prepare the existing immutable snapshot. Native binaries must
 still be built separately from the same selected source. Do not confuse either
 preparation mode with npm/crates publication or precompiled distribution.
+
+Repeatable collaborative candidate checks (set explicit checkout roots first):
+
+```sh
+# In lenso, before its frozen install and focused framework builds:
+bun scripts/prepare-runtime.ts --runtime-root "$LENSO_RUNTIME_ROOT"
+# In lenso-runtime, after its frozen install:
+bun run build:sdk
+bun run typecheck
+bun scripts/local.ts debug
+# In lenso-rust (each builder preserves root Cargo.lock):
+sh scripts/build-runtime.sh --runtime-root "$LENSO_RUNTIME_ROOT"
+sh scripts/build-runtime.sh --runtime-root "$LENSO_RUNTIME_ROOT" --bin logs-client --out target/debug/logs-client
+LENSO_RUNTIME_ROOT="$LENSO_RUNTIME_ROOT" bun test scripts/build-runtime.test.ts
+# Back in lenso-runtime, with both native consumer roots selected:
+bun run smoke
+bun run verify:lenso
+```
+
+`local.ts debug|release` runs the existing kernel Cargo build and records a
+local, path-free `.source.json` sidecar beside the binary. The Rust staged builder
+records the same Runtime inventory, the native application inventory, binary
+SHA-256, actual Cargo profile and build wall time only after success.
+Cross-source smoke/perf/verification
+reject missing proofs, changed sources or changed binaries rather than falling
+back. TS preparation hashes and built SDK bytes must match the selected Runtime
+checkout too. These are development consistency checks, not signed artifact
+attestation. Changing Runtime source requires rebuilding the matching proofs;
+unchanged checks reuse Cargo's cache and do not perform another full build.
 
 ## Native Rust application integration
 
@@ -194,11 +222,12 @@ at the server service. There is no generic management invocation bypass.
 
 ## Performance
 
-For the three-path source comparison, prepare Lenso's framework packages and build
+For the four-path source comparison, prepare Lenso's framework packages and build
 Runtime's release kernel plus the native Rust release App:
 
 ```sh
-cargo build --locked -p kernel --release
+bun run build:sdk
+bun scripts/local.ts release
 # From lenso-rust, selecting this Runtime checkout:
 sh scripts/build-runtime.sh --runtime-root "$LENSO_RUNTIME_ROOT" --release --out target/release/logs-batch
 # From lenso-runtime, with LENSO_ROOT and LENSO_RUST_ROOT explicitly set:
@@ -206,12 +235,22 @@ PERF_REQUESTS=1000 PERF_RECORDS=1000 PERF_CONCURRENCY=8 bun run perf
 ```
 
 `perf` uses the same 1000-record bounded batch and checks every output across
-native TS, TS→kernel→TS native App, and TS→kernel→Rust native App. Both remote
+native TS App, native Rust App (`logs-batch --native-bench`), TS→kernel→TS native
+App, and TS→kernel→Rust native App. Both remote
 implementations use one owned kernel. Output includes per-request p50/p95/p99,
 throughput, error rate, measured business time, all process RSS/CPU samples,
 32-item slow-consumer streams and overload/settlement diagnostics. Missing
-business timings are `null`, not invented zeros. Without `LENSO_ROOT`, the
-standalone SDK comparison remains available, but remote TS is explicitly unmeasured.
+business timings are `null`, not invented zeros. Both `LENSO_ROOT` and
+`LENSO_RUST_ROOT` are required; there is no standalone substitution in this benchmark.
+All four paths disable cache storage with `LENSO_BATCH_CACHE_TTL_MS=0` while
+retaining the same service/key/cache lookup work. First-operation cold latency is
+reported separately from warm p50/p95/p99 after 100 excluded warmup operations.
+Cold means first operation after native App setup or remote readiness, not process
+launch or an empty Cargo cache. Native Rust timing excludes stdin parsing and
+process launch. JSON input/output payload bytes exclude protocol framing; native
+operations do not serialize for transport, but local cache keys/values still do.
+Recorded build wall times are separate and
+retain the actual Cargo cache state; TypeScript compile time is unmeasured.
 The contract caps batches at 1000; this aggregation is still cheap and transport
 cost dominates. It is **not evidence of a general Rust speed advantage**.
 Pure business timers exclude transport and Rust input conversion; their structured
@@ -219,7 +258,8 @@ stderr logging still contributes to remote end-to-end cost. Output equality chec
 are outside latency samples but inside throughput. No side-effectful replay or
 production data upload is performed.
 
-Observed source-checkout run: Apple M2 Pro, macOS/Darwin 27.0.0 arm64, Bun 1.4.3,
+Historical three-path source-checkout run (before cache/log native App integration,
+not a result for the current four-path workload): Apple M2 Pro, macOS/Darwin 27.0.0 arm64, Bun 1.4.3,
 Rust 1.101.0-nightly, optimized native binaries, no external telemetry. No other
 agent build/test was running during this sample; the machine was not isolated.
 Each path completed 1000 requests with 1000 records (60915 input bytes), concurrency
