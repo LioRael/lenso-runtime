@@ -1,0 +1,14 @@
+examples/multitransport/RUN.md
+  h_9d56aba080c170 153
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "765db7a60f0020c1ecce99ef75ff7f7f99e4a385",
+  "prompts": {},
+  "humans": {
+    "h_9d56aba080c170": {
+      "author": "LioRael <leo@lenso.dev>"
+    }
+  }
+}
