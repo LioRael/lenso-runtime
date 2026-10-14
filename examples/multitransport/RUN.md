@@ -150,7 +150,7 @@ The two complete reports (including full manifests, launch configurations and ob
 | Three transports | 667,482 | `095495c501ef8ec8747b1d9d8a480f6e6c01aa42323f9596969ea4656e8069d3.json` |
 | Paired TCP | 466,277 | `2db393fef8cc58ea9b19c96176c8cab7bf9790fb12cbdb3d7d96b3b1a3a82062.json` |
 
-The disposable executor's ignored copies alone are not durable handoff. Exact-byte copies, preflight proof inventories and stderr logs are temporarily VFS-registered under `evidence-handoff/`, with `manifest.json` defining SHA-256, byte counts and intended ignored destinations. Acceptance must first verify those bytes in the parent attached workspace, move them to durable ignored `.perf-artifacts/` without altering bytes, verify again, then remove the temporary handoff. This document does not claim that parent acceptance or ignored-archive replication has already occurred. Do not commit temporary raw files or delete plans before acceptance.
+The parent workspace accepted the exact-byte reports, preflight proof inventories and stderr logs after verifying SHA-256 and byte counts before and after copying to ignored `.perf-artifacts/`. Its archive manifest is `.perf-artifacts/final-2026-10-14/handoff-manifest.json`. The temporary handoff directories and implementation plans were then removed. These archives remain local to that accepted checkout, not automatically VFS-replicated or included in a fresh clone. Do not commit raw artifacts or assume another checkout contains them.
 
 Synthetic helper validation is separate from live measurement:
 
