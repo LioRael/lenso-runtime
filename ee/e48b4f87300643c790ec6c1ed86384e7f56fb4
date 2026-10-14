@@ -1,0 +1,80 @@
+.gitignore
+  h_9d56aba080c170 5
+README.md
+  h_9d56aba080c170 284-295,299-316
+crates/kernel/src/lib.rs
+  h_9d56aba080c170 2-3,5,33,46,58,74-75,86-155,166-167,176,179-183,187,213-232,234-267,291-298,317-319,404-405,407,421-423,427-430,436-440,449-452,455,457-470,633,637,641,675,679-682,692-693,702,708-709,717,723,745-749,762,765,774-776,781,811,827-828,831-832,841,861,864-869,874-878,883-887,900-914,917-918,923,925,930-931,946,969,971
+crates/kernel/src/session_tests.rs
+  h_9d56aba080c170 140-599
+crates/kernel/tests/runtime.rs
+  h_9d56aba080c170 285,310-315,323-331,337-403
+crates/protocol/src/lib.rs
+  h_9d56aba080c170 9-14,66-86,111,116-190,192-194,367-398,481-491,608-610
+crates/protocol/src/prepared_tests.rs
+  h_9d56aba080c170 1-277
+crates/sdk/src/lib.rs
+  h_9d56aba080c170 23-24,54-55,159-164,175,218-221,288,311-312,382,510-514,528-538,582,673,694,826,845-846,858-866,882-890,1000,1019-1021,1038-1047,1231-1233,1283,1299-1301,1307,1312,1314-1316,1332-1335,1411-1412,1416-1466,1871-1877,1903-2210,2338-2339
+crates/sdk/src/prepared.rs
+  h_9d56aba080c170 1-64
+crates/sdk/tests/schema-cases.json
+  h_9d56aba080c170 3-4
+examples/multitransport/RUN.md
+  h_9d56aba080c170 8,10-11,14,16,18-24,34-51,53,55,57-144,146,148-151,153,155,158-160,163
+examples/multitransport/baseline.json
+  h_9d56aba080c170 1
+examples/multitransport/final-tcp-v2.json
+  h_9d56aba080c170 1
+examples/multitransport/final-transports-v2.json
+  h_9d56aba080c170 1
+examples/multitransport/local.ts
+  h_9d56aba080c170 5,53-60,112-115
+examples/multitransport/measure.ts
+  h_9d56aba080c170 5,38-40,89-90
+examples/multitransport/results.json
+  h_9d56aba080c170 1
+examples/multitransport/tcp-policy-check.json
+  h_9d56aba080c170 1
+examples/multitransport/tcp-regression-check.json
+  h_9d56aba080c170 1
+scripts/benchmark-evidence.test.ts
+  h_9d56aba080c170 1-335
+scripts/benchmark-evidence.ts
+  h_9d56aba080c170 1-212
+scripts/benchmark-migration.ts
+  h_9d56aba080c170 1-83
+scripts/local.ts
+  h_9d56aba080c170 29,34,37,39
+scripts/transport-build.ts
+  h_9d56aba080c170 1-49
+scripts/transport-perf.ts
+  h_9d56aba080c170 3-4,6-11,13-31,33-37,39-43,45-46
+scripts/transport-tcp-check.ts
+  h_9d56aba080c170 7,11-23,32,55-61,65-67,69-72,76-94,97-105,107
+sdk/typescript/cancellation.test.ts
+  h_9d56aba080c170 1-25
+sdk/typescript/cancellation.ts
+  h_9d56aba080c170 1-22
+sdk/typescript/index.ts
+  h_9d56aba080c170 4,436-437,674-675,714,733,737,743,779
+sdk/typescript/schema.test.ts
+  h_9d56aba080c170 1-50
+sdk/typescript/schema.ts
+  h_9d56aba080c170 16-17,205-216
+sdk/typescript/sdk.test.ts
+  h_9d56aba080c170 3,6,32-39,97,127,264-365,648-802
+sdk/typescript/transport.test.ts
+  h_9d56aba080c170 48-137
+sdk/typescript/transport.ts
+  h_9d56aba080c170 28,44-64,66,74,76-86,89-106,111-116,159
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "eee48b4f87300643c790ec6c1ed86384e7f56fb4",
+  "prompts": {},
+  "humans": {
+    "h_9d56aba080c170": {
+      "author": "LioRael <leo@lenso.dev>"
+    }
+  }
+}
