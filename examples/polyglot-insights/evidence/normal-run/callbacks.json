@@ -1,0 +1,34 @@
+[
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-51333aec-690f-42b1-a382-c69636a4cd38",
+      "service": "cleaner",
+      "instance": "python-one"
+    },
+    "call_id": "2",
+    "trace_id": "application-report",
+    "parent_id": "1"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "application-report",
+    "cancelled": false
+  },
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-51333aec-690f-42b1-a382-c69636a4cd38",
+      "service": "metrics",
+      "instance": "rust-one"
+    },
+    "call_id": "5",
+    "trace_id": "application-report",
+    "parent_id": "4"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "application-report",
+    "cancelled": false
+  }
+]

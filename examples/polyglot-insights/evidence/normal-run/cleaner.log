@@ -1,0 +1,5 @@
+{"event": "cleaner_ready", "sdk_source": "<repo>/sdk/python/src/lenso_runtime/__init__.py"}
+{"event": "prepare_started", "trace_id": "application-report", "call_id": "1", "parent_id": null, "caller": {"namespace": "insights-51333aec-690f-42b1-a382-c69636a4cd38", "service": "gateway", "instance": "ts-one"}}
+{"event": "prepare_finished", "completed": true, "trace_id": "application-report", "call_id": "1", "parent_id": null, "caller": {"namespace": "insights-51333aec-690f-42b1-a382-c69636a4cd38", "service": "gateway", "instance": "ts-one"}}
+{"event": "render", "trace_id": "application-report", "call_id": "6", "parent_id": "4", "caller": {"namespace": "insights-51333aec-690f-42b1-a382-c69636a4cd38", "service": "metrics", "instance": "rust-one"}}
+{"event": "cleaner_closed"}

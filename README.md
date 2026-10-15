@@ -34,6 +34,14 @@ replace the native App or development build/hot-replacement supervisor.
 One Host process represents one scoped Service instance. Multiple instances may
 register the same Service contract.
 
+## Python services (first SDK)
+
+The [Python SDK](sdk/python/README.md) adds typed asyncio clients and ordinary
+Python service functions over existing v1 **loopback TCP, owned Unix stdio and optional loopback WebSocket**. It uses
+the same JSON contracts and Rust kernel; TS/Rust plugin composition stays native.
+See [the Python examples](examples/python/) for bidirectional interoperability and
+[verification evidence](examples/python/VERIFICATION.md). Python remote mode, promotion and deferred activation are not implemented.
+
 ## Mixed local transports
 
 TCP remains the SDK default. Only connection/start configuration chooses a

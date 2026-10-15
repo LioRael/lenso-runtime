@@ -1,0 +1,290 @@
+[
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0",
+      "service": "cleaner",
+      "instance": "python-one"
+    },
+    "call_id": "2",
+    "trace_id": "application-report",
+    "parent_id": "1"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "application-report",
+    "cancelled": false
+  },
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0",
+      "service": "metrics",
+      "instance": "rust-one"
+    },
+    "call_id": "5",
+    "trace_id": "application-report",
+    "parent_id": "4"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "application-report",
+    "cancelled": false
+  },
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0",
+      "service": "cleaner",
+      "instance": "python-one"
+    },
+    "call_id": "8",
+    "trace_id": "7",
+    "parent_id": "7"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "7",
+    "cancelled": false
+  },
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0",
+      "service": "cleaner",
+      "instance": "python-one"
+    },
+    "call_id": "17",
+    "trace_id": "concurrent-0",
+    "parent_id": "11"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "concurrent-0",
+    "cancelled": false
+  },
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0",
+      "service": "cleaner",
+      "instance": "python-one"
+    },
+    "call_id": "18",
+    "trace_id": "concurrent-1",
+    "parent_id": "12"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "concurrent-1",
+    "cancelled": false
+  },
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0",
+      "service": "cleaner",
+      "instance": "python-one"
+    },
+    "call_id": "19",
+    "trace_id": "concurrent-2",
+    "parent_id": "13"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "concurrent-2",
+    "cancelled": false
+  },
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0",
+      "service": "cleaner",
+      "instance": "python-one"
+    },
+    "call_id": "20",
+    "trace_id": "concurrent-3",
+    "parent_id": "14"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "concurrent-3",
+    "cancelled": false
+  },
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0",
+      "service": "cleaner",
+      "instance": "python-one"
+    },
+    "call_id": "21",
+    "trace_id": "concurrent-4",
+    "parent_id": "15"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "concurrent-4",
+    "cancelled": false
+  },
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0",
+      "service": "cleaner",
+      "instance": "python-one"
+    },
+    "call_id": "22",
+    "trace_id": "concurrent-5",
+    "parent_id": "16"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "concurrent-5",
+    "cancelled": false
+  },
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0",
+      "service": "metrics",
+      "instance": "rust-one"
+    },
+    "call_id": "30",
+    "trace_id": "backpressure",
+    "parent_id": "29"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "backpressure",
+    "cancelled": false
+  },
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0",
+      "service": "cleaner",
+      "instance": "python-one"
+    },
+    "call_id": "32",
+    "trace_id": "python-nested-cancel",
+    "parent_id": "31"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "python-nested-cancel",
+    "cancelled": true
+  },
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0",
+      "service": "cleaner",
+      "instance": "python-one"
+    },
+    "call_id": "34",
+    "trace_id": "python-deadline",
+    "parent_id": "33"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "python-deadline",
+    "cancelled": false
+  },
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0",
+      "service": "metrics",
+      "instance": "rust-one"
+    },
+    "call_id": "37",
+    "trace_id": "rust-nested-cancel",
+    "parent_id": "36"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "rust-nested-cancel",
+    "cancelled": true
+  },
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0",
+      "service": "metrics",
+      "instance": "rust-one"
+    },
+    "call_id": "39",
+    "trace_id": "rust-deadline",
+    "parent_id": "38"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "rust-deadline",
+    "cancelled": false
+  },
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0",
+      "service": "cleaner",
+      "instance": "python-one"
+    },
+    "call_id": "41",
+    "trace_id": "python-disconnect",
+    "parent_id": "40"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "python-disconnect",
+    "cancelled": false
+  },
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0",
+      "service": "cleaner",
+      "instance": "python-one"
+    },
+    "call_id": "44",
+    "trace_id": "new-explicit-call",
+    "parent_id": "43"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "new-explicit-call",
+    "cancelled": false
+  },
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0",
+      "service": "metrics",
+      "instance": "rust-one"
+    },
+    "call_id": "47",
+    "trace_id": "rust-disconnect",
+    "parent_id": "46"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "rust-disconnect",
+    "cancelled": false
+  },
+  {
+    "event": "policy_started",
+    "caller": {
+      "namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0",
+      "service": "cleaner",
+      "instance": "python-one"
+    },
+    "call_id": "49",
+    "trace_id": "kernel-disconnect",
+    "parent_id": "48"
+  },
+  {
+    "event": "policy_finished",
+    "trace_id": "kernel-disconnect",
+    "cancelled": true
+  }
+]

@@ -1,0 +1,60 @@
+import assert from "node:assert/strict";
+import { RuntimeHost, BusinessError } from "@lenso/runtime-sdk";
+import { NamesClient, namesContract, isTryError, type EchoNamesInput } from "./names";
+
+export async function startService(port: number) {
+  return RuntimeHost.connect({
+    namespace: "identifiers", service: "typescript", instance: "one", port,
+    contract: namesContract,
+    handlers: {
+      "echo-names": (input: unknown) => input,
+      "try": (input: unknown) => {
+        if (input) throw new BusinessError({ "error-code": "expected", self: "wire" });
+        return "ok";
+      },
+      "stream-items": async function* (input) { yield input; },
+      "constructor": (input: unknown) => input,
+      ["__proto__"]: (input: unknown) => input,
+      "new": (input: unknown) => input,
+      "build": (input: unknown) => input,
+      "control\b\f\0\r\n\\b": (input: unknown) => input,
+    },
+  });
+}
+
+export async function exercise(port: number, input: EchoNamesInput) {
+  // Typecheck property access and mapped method calls against fresh output.
+  const keyword: string = input.type;
+  const hyphen: string = input["first-name"];
+  const empty: string = input[""];
+  const optional: number | undefined = input["optional-value"];
+  assert.equal(keyword, "value:type");
+  assert.equal(hyphen, "value:first-name");
+  assert.equal(empty, "value:");
+  assert.equal(optional, undefined);
+  const host = await RuntimeHost.connect({
+    namespace: "identifiers", service: "ts-client", instance: "one", port,
+    contract: { version: "1", methods: {} },
+  });
+  try {
+    const client = new NamesClient(host, { namespace: "identifiers", service: "rust" });
+    assert.deepEqual(await client.echo_names(input), input);
+    assert.equal(await client.try(false), "ok");
+    await assert.rejects(client.try(true), (error: unknown) => {
+      assert.ok(isTryError(error));
+      assert.equal(error.details["error-code"], "expected");
+      assert.equal(error.details.self, "wire");
+      return true;
+    });
+    const values = [];
+    for await (const item of client.stream_items(input)) values.push(item);
+    assert.deepEqual(values, [input]);
+    assert.equal(await client.constructor_("constructor"), "constructor");
+    assert.equal(await client.__proto___("proto"), "proto");
+    assert.equal(await client.new_("new"), "new");
+    assert.equal(await client.build_("build"), "build");
+    assert.equal(await client.control______b("controls"), "controls");
+  } finally {
+    await host.close();
+  }
+}

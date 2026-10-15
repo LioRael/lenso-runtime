@@ -1,0 +1,10 @@
+[
+  {
+    "command": "python3",
+    "args": ["examples/python/service.py"],
+    "namespace": "demo",
+    "service": "python-logs",
+    "instance": "python-one",
+    "transport": "stdio"
+  }
+]

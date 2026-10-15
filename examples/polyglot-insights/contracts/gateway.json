@@ -1,0 +1,50 @@
+{
+  "version": "1",
+  "methods": {
+    "policy": {
+      "mode": "unary",
+      "input": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "output": {
+        "type": "object",
+        "properties": {
+          "slow_ms": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 60000
+          },
+          "services": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "maxLength": 32
+            },
+            "maxItems": 16
+          }
+        },
+        "required": [
+          "slow_ms",
+          "services"
+        ],
+        "additionalProperties": false
+      },
+      "error": {
+        "type": "object",
+        "properties": {
+          "reason": {
+            "type": "string",
+            "maxLength": 128
+          }
+        },
+        "required": [
+          "reason"
+        ],
+        "additionalProperties": false
+      }
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{"event": "cleaner_ready", "sdk_source": "<repo>/sdk/python/src/lenso_runtime/__init__.py"}
+{"event": "prepare_started", "trace_id": "new-explicit-call", "call_id": "43", "parent_id": null, "caller": {"namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0", "service": "gateway", "instance": "ts-one"}}
+{"event": "prepare_finished", "completed": true, "trace_id": "new-explicit-call", "call_id": "43", "parent_id": null, "caller": {"namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0", "service": "gateway", "instance": "ts-one"}}
+{"event": "prepare_started", "trace_id": "kernel-disconnect", "call_id": "48", "parent_id": null, "caller": {"namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0", "service": "gateway", "instance": "ts-one"}}
+{"event": "prepare_finished", "completed": false, "trace_id": "kernel-disconnect", "call_id": "48", "parent_id": null, "caller": {"namespace": "insights-39fd8e14-642d-4377-a175-51de60eefbf0", "service": "gateway", "instance": "ts-one"}}
+{"event": "cleaner_closed"}
