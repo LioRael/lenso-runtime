@@ -1,0 +1,14 @@
+crates/sdk/src/lib.rs
+  h_9d56aba080c170 139-153,313-314,353,398-402,434-444,473-480,509,520-521,549,575-637,815-819,1065,1070-1084,1111-1125,1345-1481,1733,1744-1745
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "dd0eb084e490e5e4bda05ce0dbb503f3aae50590",
+  "prompts": {},
+  "humans": {
+    "h_9d56aba080c170": {
+      "author": "LioRael <leo@lenso.dev>"
+    }
+  }
+}
