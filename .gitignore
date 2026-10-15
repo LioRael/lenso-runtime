@@ -3,3 +3,10 @@ node_modules/
 /sdk/typescript/dist/
 /.native-check/
 /.perf-artifacts/
+
+__pycache__/
+*.py[cod]
+*.egg-info/
+/sdk/python/build/
+/sdk/python/dist/
+/sdk/python/.venv/

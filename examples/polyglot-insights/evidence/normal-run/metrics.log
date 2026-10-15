@@ -1,0 +1,9 @@
+{"event":"metrics_ready"}
+{"caller":{"instance":"python-one","namespace":"insights-51333aec-690f-42b1-a382-c69636a4cd38","service":"cleaner"},"event":"limits","parent_id":"1","trace_id":"application-report"}
+{"call_id":"4","caller":{"instance":"ts-one","namespace":"insights-51333aec-690f-42b1-a382-c69636a4cd38","service":"gateway"},"event":"analyze_started","trace_id":"application-report"}
+{"event":"chunk_sent","processed":2,"trace_id":"application-report"}
+{"event":"chunk_sent","processed":4,"trace_id":"application-report"}
+{"event":"chunk_sent","processed":6,"trace_id":"application-report"}
+{"event":"chunk_sent","processed":8,"trace_id":"application-report"}
+{"event":"chunk_sent","processed":10,"trace_id":"application-report"}
+{"call_id":"4","cancelled":false,"completed":true,"event":"analyze_finished","sent":5,"trace_id":"application-report"}

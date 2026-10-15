@@ -10,6 +10,9 @@ jobs:
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: 1.4.3
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
       - uses: dtolnay/rust-toolchain@stable
       - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run build:sdk
@@ -18,3 +21,7 @@ jobs:
       - run: cargo test --workspace --locked
       - run: cargo build --workspace --locked
       - run: bun run smoke
+      - name: Install Python SDK
+        run: python -m pip install "./sdk/python[websocket]"
+      - name: Python SDK and cross-language checks
+        run: python -W error -m unittest discover -s sdk/python/tests -v

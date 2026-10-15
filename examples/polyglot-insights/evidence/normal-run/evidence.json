@@ -1,0 +1,263 @@
+{
+  "started_at": "2026-10-15T05:32:05.316Z",
+  "transport": "loopback-tcp",
+  "languages": [
+    "typescript",
+    "rust",
+    "python"
+  ],
+  "not_covered": [
+    "go",
+    "stdio",
+    "websocket",
+    "production networking",
+    "side-effect rollback"
+  ],
+  "input": "<repo>/examples/polyglot-insights/fixtures/requests.csv",
+  "python_sdk_source": "<repo>/sdk/python/src",
+  "proof": {
+    "runtime_commit": "e3c557dc92d962128961f49e3612f6718d33bf2f",
+    "runtime_source_sha256": {
+      "bun.lock": "40768c0456eacd51990635070539c064a0deb9f5415677177728c54cfd58f2fb",
+      "Cargo.lock": "9402e640171c6caf8871ba315c6e44a42284f08d42729482a4754e92016a3913",
+      "Cargo.toml": "a31322454fa41a56b01d0c0226084889bdda60aadd588d5b2acce5b0aa1ded40",
+      "crates/kernel/Cargo.toml": "c658b6be86c62822293bf6aa900ca4be142e83e98e472a3b8cfda82ad591d574",
+      "crates/kernel/src/lib.rs": "f5e1548bd303d4615bd45d51cac2f8f9d24088e183f23762b957286d80d17af4",
+      "crates/kernel/src/main.rs": "cdad07fb601cbac7c9a2edaaf802286f77f5ee56454128f8556143d79ff24cf5",
+      "crates/kernel/src/process.rs": "a8ca058d2f560b7a1f0b14b53cac209af3fd81e9bb1343ac338418d6cbeb41e6",
+      "crates/kernel/src/session_tests.rs": "82069965d4e767f0ca8b6d5835a8b27b3080bc88e0bf78f4cf73bb702afc79c6",
+      "crates/kernel/tests/runtime.rs": "9d9aee6a9454a1a8fc3509e772dd49a566c294d34f0c5f6bb189a7e319f2c768",
+      "crates/kernel/tests/transports.rs": "8b0f3ffaff9f7754c2f94bac5eaa9dc05c8236984bf657988b0f9bddfda96a08",
+      "crates/protocol/Cargo.toml": "bf7f7324660762c4cbe7027917a9cd307b62c54132855e97b6f1061b94a39ceb",
+      "crates/protocol/src/lib.rs": "4f2b676723172bcd914530cb209a27820ff8639c7d36babb46afdca465672528",
+      "crates/protocol/src/prepared_tests.rs": "d296b69e0e8417463d6e1989a4b39ec4a7ae6f1fdb5bc5aee025bc6387da62cc",
+      "crates/sdk/Cargo.toml": "759c181eb139eec43b5a13069182599d7ddffe62a2b43efb000229c20c3516ec",
+      "crates/sdk/src/lib.rs": "cd51d0ac5e4802350fd1803eeb15d7114c174abd092f455d264659d604fa0c72",
+      "crates/sdk/src/prepared.rs": "887cf15165ad114f02f7d53bb332706beff5ef6df4e9f48cb6a8d6d9c808f04e",
+      "crates/sdk/tests/schema-cases.json": "ecc5ae161d8b0cea2646f180890ff97e748c14e3a9253c7625e9e726ffd5f4e3",
+      "crates/sdk/tests/stdio.rs": "9338a402472f9f5f50998dfdc8cacffcb430c9feb638cb30da44547f1fe9ffa4",
+      "crates/transport/Cargo.toml": "85b3a0bd3c0548ed1594fca6ae5a3ad5ce8a69081015a719355e8a93b8fef764",
+      "crates/transport/src/diagnostics.rs": "4b12e0bd40e7714ca7531e80ccfbe0ce46811c87b281a133d1a379e581cb0f73",
+      "crates/transport/src/lib.rs": "d48af768b3ca27539691c0a9195967c455b32c0c76292d0407d75f8aa48cd779",
+      "crates/transport/src/stdio.rs": "4a15b8cd3815666c88c81dcb8051ce5c12ca84d551756ecfc5926c33a7c78511",
+      "crates/transport/tests/framing.rs": "15bf1abb73b7ccda62fb99c1ae6147484c3eedd9cf8280d2eddfb8973c1910c3",
+      "examples/contracts/logs.json": "132cd9966079efba18d209a3a2871f9d19dc116c46fc62909d12fd088f467215",
+      "package.json": "5aec14e51ec09540c95377b9da9b0592ef640e9b1f36fcea2bb93e6686e90b88",
+      "sdk/typescript/cancellation.test.ts": "fb36c8ff8f43ca8fafc6930843b891f8ddb94d67ba40d1fe4fbcf572202864b2",
+      "sdk/typescript/cancellation.ts": "2e99f802a6d199ff3a3e9d671585d91505f3eb65988ad834f7d49be3104e8866",
+      "sdk/typescript/index.ts": "3f179a8ce119c0bfb0c5b1d626d6381c3f22db88260cb0311ddbfa1df6c79cb6",
+      "sdk/typescript/package.json": "989a6afa3b3d940d729635b3a45f9fbc0ab763567ad26a1febc9abc1cc16d96a",
+      "sdk/typescript/schema.test.ts": "238d9571f537c60785685a62c584d47730055d4f341b2cc96b7d7bc5fd793920",
+      "sdk/typescript/schema.ts": "30cd91d0ad9f7816c9df4f768873225e7dc7160526033af74f4ee1aeb576b2ca",
+      "sdk/typescript/sdk.test.ts": "4d91f66c8ea3cc70eea8160d13c3f0164f8f3ed07e6ee8d1439e22130b8afec3",
+      "sdk/typescript/stdio-peer.ts": "dc90d3f54a1d01c309b462c2da6277e7fd15058f155148f764c92efb8a72996f",
+      "sdk/typescript/transport.test.ts": "5eff37ad77e514fe7b37122e83b959e3800250f0b866221f4f853bcbabcdd7e5",
+      "sdk/typescript/transport.ts": "ba63dac3887595b0cdef80050d7fe797561c31c460df7ef3be1264d5e3f1d7b3",
+      "sdk/typescript/tsconfig.build.json": "2091f49f0391bdc2f437439b431ce12f8b654b7df5f4c2d27af0d1439caaa87f",
+      "sdk/typescript/websocket.ts": "83442973d007c962588ea8a0c73c8506b343463842044d224fb019b30b006974",
+      "tools/generate.ts": "7b51f01fb936bd479797c6a1f8999635a29dd7100cb670918fddaafa721cdff3",
+      "tsconfig.json": "bf2d127fb627f451390471bb01ef83e8397973c560f5e6ff42c57a31c940dc0b"
+    },
+    "application_source_sha256": {
+      ".gitignore": "b667323d5662d0b0b1db27a3cce893bf91d7cd392a90b4fb2774566231875d2a",
+      "cleaner.py": "502bc904d4ee72f2e2002cf83bc34497920d2cec40f6ed59ee8c252a5a547f57",
+      "contracts/cleaner.json": "d3154b419f42bbe5ad47165869735ba3fa921d3e5eaff86eeacce5d009eecab5",
+      "contracts/gateway.json": "7427f864d6a2af396eb8d1917150f6834ece1a65d527659c6afd9cb7b586e5d7",
+      "contracts/metrics.json": "7b59b3c66080cad5d19640c88feb683e6ecdb3e7cc40c59cd008a48480938f1f",
+      "fixtures/requests.csv": "d502efd518dd110cc1e50a0552c5f2b66b252368892f019ffad2f0d20ccfc821",
+      "generated/cleaner.py": "49a14f5d3994bce9d2d2507e39276cc06a0dfc4dc446098c02cca42500075f1e",
+      "generated/cleaner.rs": "4b54273f45cd19455c98f63049e83b36d4aee9e1ea3d20c941d11fb7f8d768ee",
+      "generated/cleaner.ts": "54233a35d45444a0e20efeb9358a77b0b58614236c3094b362b3c567fe3ebe98",
+      "generated/gateway.py": "b87c418db65021a69f301ee37c1ca054dd5d9586d700504ab9898d5ded6be13a",
+      "generated/gateway.rs": "239abe5c3f37b52162a0b76c3552a7e5eff86f5b65cb6d1e029ada79556bdc42",
+      "generated/gateway.ts": "596715415adefa73c73a47a1518eefe23659ea27ad64760c8f26804dd7cc8f6e",
+      "generated/metrics.py": "48ccb29b0202a16f979c671bd25bf6ef6bdb54025a856332b6298f9de1bbfb06",
+      "generated/metrics.rs": "fcea51b58abfc9b9b6b485bedc9cb12d06503f7206d52e8118fe6a7ce3fd4e02",
+      "generated/metrics.ts": "090bfc05c444a24b1c1b83d7f4d88c96c7681e85fe2e768ddb8d70ac405c6b73",
+      "lifecycle.test.ts": "88f5fd06d0d84606e763a2bf64ff5e1e29891d34b268f7d168b476e024240d40",
+      "local.ts": "36da4d4a2b8e8ee0c6f1cf66dc6dc50718df4052d8d3c07c5cee90c65645ca63",
+      "main.ts": "a4c5ac543aa19af77225721693f78072457888b52500a534d919a9bb5a926cc4",
+      "proof.ts": "e56a70c533490a2e2b66ed38d16dc141d47f982e9ae23b0cd307faa6c3339240",
+      "README.md": "84369d3e31c239312f2f1b49293390f0d3b9511137faa91a3adb69b5240a99f4",
+      "rust/Cargo.lock": "0e9c2d3bb902f8a207c11d6cd532ac4219832aa69a89c84fd03a7d0712ee4075",
+      "rust/Cargo.toml": "4c6627e7b2c7d4e080edfa561262c93174d707d72b7e9afdf1697af622c8d328",
+      "rust/src/main.rs": "58363619c11e991a93b1efeebfbec4a2c12ea211fec5a04bbea62b74f1a8f7de",
+      "tsconfig.json": "461d6051f86be12475299c43af385f77748cb48747aabbc89b6a7616f4ac7b9c",
+      "VERIFICATION.md": "ee7bf6f8585f8f91ddc6d2562cbeddd6001f8fe3aed3ab168ef509ed84ff06a4"
+    },
+    "launcher_sha256": "f921a721dd6d5229dc418d384b114e5e28480e660ee65bd62165dfd25a8072f1",
+    "python_source_sha256": {
+      "__init__.py": "af8452bcb0f1c7e22ffbe0dfc5be861f3a97a53c802efcf8018b701cef172e79",
+      "generate.py": "6e484774b940667374105eb3d1ad5bdab9f701e60effded40e1f01154e5c1da5",
+      "py.typed": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "schema.py": "18c9009af9d160f976ab011813048efca2d76548892013894c3b5d7455ddb0a2",
+      "session.py": "9ea3550a60162c36b34d1ec0eb236e0c0a5fea7b35f0eebf738571eecfda0117"
+    },
+    "binaries": {
+      "kernel_sha256": "616cd40ff164b2526c7574770bbfd355735d8939874498c2134425019d92d2bf",
+      "metrics_sha256": "800278eadbc84ae2f9cf37f8ac462aab697cfd0921b8c882ec41333289be16c1"
+    },
+    "environment": {
+      "platform": "darwin",
+      "arch": "arm64",
+      "bun": "1.4.3",
+      "python": "Python 3.14.8",
+      "rust": "rustc 1.101.0-nightly (e9bbadf68 2026-10-12)"
+    }
+  },
+  "checks": [
+    {
+      "name": "real business pipeline and all six directed language pairs",
+      "passed": true,
+      "detail": [
+        "TS→Python",
+        "Python→TS",
+        "Python→Rust",
+        "TS→Rust",
+        "Rust→TS",
+        "Rust→Python"
+      ]
+    }
+  ],
+  "result": {
+    "reasons": [
+      "line 11: unknown service",
+      "line 12: status and duration must be nonnegative integers",
+      "line 13: status and duration must be nonnegative integers",
+      "line 14: expected service,status,duration_ms"
+    ],
+    "records": [
+      {
+        "duration_ms": 40,
+        "service": "api",
+        "status": 200
+      },
+      {
+        "duration_ms": 120,
+        "service": "web",
+        "status": 200
+      },
+      {
+        "duration_ms": 800,
+        "service": "worker",
+        "status": 503
+      },
+      {
+        "duration_ms": 450,
+        "service": "api",
+        "status": 500
+      },
+      {
+        "duration_ms": 20,
+        "service": "web",
+        "status": 204
+      },
+      {
+        "duration_ms": 250,
+        "service": "worker",
+        "status": 200
+      },
+      {
+        "duration_ms": 90,
+        "service": "api",
+        "status": 200
+      },
+      {
+        "duration_ms": 330,
+        "service": "api",
+        "status": 200
+      },
+      {
+        "duration_ms": 70,
+        "service": "web",
+        "status": 200
+      },
+      {
+        "duration_ms": 180,
+        "service": "worker",
+        "status": 200
+      }
+    ],
+    "rejected": 4,
+    "progress": [
+      {
+        "error_count": 0,
+        "p95_ms": 120,
+        "processed": 2,
+        "report": "",
+        "slow_count": 0,
+        "total": 10,
+        "total_duration_ms": 160
+      },
+      {
+        "error_count": 2,
+        "p95_ms": 800,
+        "processed": 4,
+        "report": "",
+        "slow_count": 2,
+        "total": 10,
+        "total_duration_ms": 1410
+      },
+      {
+        "error_count": 2,
+        "p95_ms": 800,
+        "processed": 6,
+        "report": "",
+        "slow_count": 3,
+        "total": 10,
+        "total_duration_ms": 1680
+      },
+      {
+        "error_count": 2,
+        "p95_ms": 800,
+        "processed": 8,
+        "report": "",
+        "slow_count": 4,
+        "total": 10,
+        "total_duration_ms": 2100
+      },
+      {
+        "error_count": 2,
+        "p95_ms": 800,
+        "processed": 10,
+        "report": "10 requests; 2 server errors; 4 slow requests; p95 800 ms; mean 235.0 ms.",
+        "slow_count": 4,
+        "total": 10,
+        "total_duration_ms": 2350
+      }
+    ],
+    "summary": {
+      "error_count": 2,
+      "p95_ms": 800,
+      "processed": 10,
+      "report": "10 requests; 2 server errors; 4 slow requests; p95 800 ms; mean 235.0 ms.",
+      "slow_count": 4,
+      "total": 10,
+      "total_duration_ms": 2350
+    }
+  },
+  "finished_at": "2026-10-15T05:32:05.440Z",
+  "interrupted": false,
+  "processes": [
+    {
+      "name": "kernel",
+      "pid": 52655,
+      "exit_code": 0,
+      "signal": null
+    },
+    {
+      "name": "metrics",
+      "pid": 52656,
+      "exit_code": 0,
+      "signal": null
+    },
+    {
+      "name": "cleaner",
+      "pid": 52657,
+      "exit_code": 0,
+      "signal": null
+    }
+  ],
+  "all_children_exited": true,
+  "passed": true
+}

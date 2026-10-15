@@ -1,0 +1,6 @@
+{
+  "include": ["src", "../../examples/generated/logs.py", "../../examples/python/service.py", "../../examples/python/client.py"],
+  "extraPaths": ["src", "../../examples/generated"],
+  "pythonVersion": "3.11",
+  "typeCheckingMode": "basic"
+}
