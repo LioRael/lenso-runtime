@@ -42,6 +42,7 @@ class KernelTests(unittest.IsolatedAsyncioTestCase):
         self.hosts = []
         self.children = []
         self.cancelled = asyncio.Event()
+        self.started = asyncio.Event()
         self.produced = 0
 
         def aggregate(input, context):
@@ -51,6 +52,7 @@ class KernelTests(unittest.IsolatedAsyncioTestCase):
                     "total_duration_ms": sum(log["duration_ms"] for log in input["logs"])}
 
         async def progress(input, context):
+            self.started.set()
             try:
                 for i in range(len(input["logs"])):
                     await asyncio.sleep(input.get("delay_ms", 0) / 1000)
@@ -117,14 +119,19 @@ class KernelTests(unittest.IsolatedAsyncioTestCase):
     async def test_task_cancel_and_deadline_reach_handler(self):
         stream = self.stream(delay_ms=500)
         next_item = asyncio.create_task(anext(stream))
-        await asyncio.sleep(0.03)
+        await asyncio.wait_for(self.started.wait(), 1)
         next_item.cancel()
         with self.assertRaises(asyncio.CancelledError):
             await next_item
         await asyncio.wait_for(self.cancelled.wait(), 1)
         self.cancelled.clear()
-        timed = self.client.stream(TARGET, "progress", {"logs": LOGS, "delay_ms": 500}, timeout_ms=30)
-        await self.assertCode(anext(timed), "deadline_exceeded")
+        self.started.clear()
+        # Establish handler entry before checking propagation of a deadline.
+        # A short fixed sleep can expire before dispatch on a busy CI runner.
+        timed = self.client.stream(TARGET, "progress", {"logs": LOGS, "delay_ms": 1000}, timeout_ms=500)
+        timed_item = asyncio.create_task(anext(timed))
+        await asyncio.wait_for(self.started.wait(), 1)
+        await self.assertCode(timed_item, "deadline_exceeded")
         await asyncio.wait_for(self.cancelled.wait(), 1)
         self.assertEqual(self.client._pending, {})
 
