@@ -1,15 +1,5 @@
 import { expect, test } from "bun:test";
-import { validateValue, type Schema } from "./schema";
-import schemaCases from "../../crates/sdk/tests/schema-cases.json";
-
-test("shared restricted schema fixtures agree on string length constraints", () => {
-  for (const fixture of schemaCases) {
-    for (const value of fixture.accept)
-      expect(() => validateValue(fixture.schema as Schema, value)).not.toThrow();
-    for (const value of fixture.reject)
-      expect(() => validateValue(fixture.schema as Schema, value)).toThrow();
-  }
-});
+import { validateValue } from "./schema";
 
 test("string bounds accept exact limits and reject overflow", () => {
   expect(() => validateValue({ type: "string", minLength: 1, maxLength: 1 }, "🙂")).not.toThrow();

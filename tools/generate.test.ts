@@ -157,14 +157,16 @@ test("generated Rust and TS compile and roundtrip unchanged wire names through t
       prototypeFiles.push(file);
     }
     await run(["bun", "x", "--no-install", "tsc", "--ignoreConfig", "--noEmit", "--strict", "--target", "ES2022", "--module", "Preserve", "--moduleResolution", "Bundler", "--types", "bun", "--skipLibCheck", join(directory, "check.ts"), ...prototypeFiles]);
-    await run(["cargo", "build", "--manifest-path", join(directory, "Cargo.toml"), "--target-dir", join(root, "target/generator-identifiers")]);
+    // Share dependency artifacts with the sequential workspace checks; the fixture
+    // remains an independent package and still compiles its generated Rust.
+    await run(["cargo", "build", "--manifest-path", join(directory, "Cargo.toml"), "--target-dir", join(root, "target")]);
     const generated = await import(join(directory, "names.ts"));
     expect(generated.namesContract).toEqual(fixtureContract);
     expect(Object.hasOwn(generated.namesContract.methods, "__proto__")).toBe(true);
     expect(Object.hasOwn(generated.namesContract.methods["echo-names"].input.properties, "__proto__")).toBe(true);
     validateValue(generated.namesContract.methods["echo-names"].input, payload);
     const check = await import(join(directory, "check.ts"));
-    child = Bun.spawn([join(root, "target/generator-identifiers/debug/generator-identifiers")], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
+    child = Bun.spawn([join(root, "target/debug/generator-identifiers")], { stdin: "pipe", stdout: "pipe", stderr: "pipe" });
     stderr = new Response(child.stderr as ReadableStream).text();
     deadline = setTimeout(() => child?.kill("SIGKILL"), 15_000);
     const reader = (child.stdout as ReadableStream<Uint8Array>).getReader();

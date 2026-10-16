@@ -8,8 +8,13 @@ cleanup. Only explicitly exported capabilities cross the kernel.
 
 Normal TS/Go/Python services use a precompiled kernel through the current Rust
 `LioRael/lenso-cli`; no Rust toolchain is needed. [Distribution guide](docs/distribution.md)
-explains version selection, local overrides, prepared platform assets and release
-steps. This is local implementation only: no official release is published yet.
+explains version selection, local overrides, five native platform assets and release
+steps. Public [Runtime v0.1.0](https://github.com/LioRael/lenso-runtime/releases/tag/v0.1.0)
+was published from `d2539a05f39b89aae733893a8c8b75ce55882666`; its
+[five-platform release run](https://github.com/LioRael/lenso-runtime/actions/runs/38880149851)
+passed. The matching [CLI v0.1.0](https://github.com/LioRael/lenso-cli/releases/tag/v0.1.0)
+release requires access to the private CLI repository. Later local source changes
+remain development candidates until separately released.
 
 ## Build and run
 
@@ -188,7 +193,7 @@ binary overrides when running the example. No machine-specific path is stored.
 Console has its own pinned `prepare:runtime` workflow and
 `packages/console-runtime/README.md` for its existing Auth-bound host.
 
-For this checkout's current, unpublished candidate, run
+For an unpublished source candidate beyond the released baseline, run
 `bun run prepare:runtime --runtime-root ../lenso-runtime` in each consuming
 repository before its frozen install (adjust the checkout-relative path).
 This explicitly selects trusted local source bytes, including current edits;

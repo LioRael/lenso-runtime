@@ -1,5 +1,10 @@
 name: Source checks
-on: [push, pull_request]
+on:
+  push:
+    branches: [main, 'land/**']
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
 permissions:
   contents: read
 jobs:
@@ -17,7 +22,7 @@ jobs:
       - run: bun install --frozen-lockfile --ignore-scripts
       - run: bun run build:sdk
       - run: bun run typecheck
-      - run: bun test sdk/typescript tools scripts/local.test.ts
+      - run: bun test sdk/typescript tools scripts
       - run: cargo test --workspace --locked
       - run: cargo build --workspace --locked
       - run: bun run smoke
