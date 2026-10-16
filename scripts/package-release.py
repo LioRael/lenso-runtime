@@ -15,4 +15,5 @@ a.output.mkdir(parents=True, exist_ok=True)
 name = f"lenso-runtime-v{version}-{a.target}" + (".exe" if "windows" in a.target else "")
 asset = a.output / name
 shutil.copy2(a.binary, asset)
-(a.output / (name + ".sha256")).write_text(hashlib.sha256(asset.read_bytes()).hexdigest() + "  " + name + "\n")
+# Manifest bytes must use LF even on Windows; Linux sha256sum treats CR as filename data.
+(a.output / (name + ".sha256")).write_bytes((hashlib.sha256(asset.read_bytes()).hexdigest() + "  " + name + "\n").encode("ascii"))
