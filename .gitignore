@@ -10,3 +10,5 @@ __pycache__/
 /sdk/python/build/
 /sdk/python/dist/
 /sdk/python/.venv/
+
+/dist/

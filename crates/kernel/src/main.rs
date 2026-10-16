@@ -4,6 +4,10 @@ use tokio::net::TcpListener;
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
+    if args.as_slice() == ["--version"] {
+        println!("lenso-runtime {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let mut listen = "127.0.0.1:7331";
     let mut websocket = None;
     let mut processes = None;

@@ -4,6 +4,13 @@ A local cross-language execution kernel, not a replacement for TypeScript
 Lenso. Plugins inside a service keep native calls, dependency injection and
 cleanup. Only explicitly exported capabilities cross the kernel.
 
+## Precompiled use
+
+Normal TS/Go/Python services use a precompiled kernel through the current Rust
+`LioRael/lenso-cli`; no Rust toolchain is needed. [Distribution guide](docs/distribution.md)
+explains version selection, local overrides, prepared platform assets and release
+steps. This is local implementation only: no official release is published yet.
+
 ## Build and run
 
 Requirements for this source checkout: Rust/Cargo and Bun.
