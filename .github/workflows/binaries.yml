@@ -1,0 +1,79 @@
+name: Precompiled binaries
+on:
+  pull_request:
+    paths: ['src/**', 'crates/**', 'Cargo.*', 'scripts/package-release.py', '.github/workflows/binaries.yml']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact existing source tag (must match Cargo version to publish)
+        required: true
+        default: v0.1.0
+      publish:
+        description: Create a draft release from the selected tag after all native smoke checks
+        type: boolean
+        default: false
+permissions:
+  contents: read
+jobs:
+  build:
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { runner: macos-14, target: aarch64-apple-darwin, suffix: '' }
+          - { runner: macos-15-intel, target: x86_64-apple-darwin, suffix: '' }
+          - { runner: ubuntu-22.04, target: x86_64-unknown-linux-gnu, suffix: '' }
+          - { runner: ubuntu-22.04-arm, target: aarch64-unknown-linux-gnu, suffix: '' }
+          - { runner: windows-2022, target: x86_64-pc-windows-msvc, suffix: '.exe' }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: cargo build --release --locked -p kernel --target ${{ matrix.target }}
+      - name: Native executable smoke (not a cross-compilation claim)
+        run: target/${{ matrix.target }}/release/lenso-runtime${{ matrix.suffix }} --version
+      - name: Native loopback/manager smoke
+        run: python scripts/smoke-binary.py target/${{ matrix.target }}/release/lenso-runtime${{ matrix.suffix }}
+      - name: Package versioned binary and checksum
+        env:
+          RELEASE_VERSION: ${{ inputs.version || 'v0.1.0' }}
+        shell: bash
+        run: python scripts/package-release.py --binary target/${{ matrix.target }}/release/lenso-runtime${{ matrix.suffix }} --target ${{ matrix.target }} --version "$RELEASE_VERSION" --output dist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lenso-runtime-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+  assemble:
+    needs: build
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lenso-runtime-*
+          merge-multiple: true
+          path: dist
+      - name: Assemble SHA256SUMS
+        run: cat dist/*.sha256 | sort -k2 > dist/SHA256SUMS && cd dist && sha256sum --check SHA256SUMS && rm -- *.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lenso-runtime-release-candidate
+          path: dist/*
+      - name: Require explicit matching source tag before draft creation
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+        env:
+          VERSION: ${{ inputs.version }}
+        run: test "$GITHUB_REF" = "refs/tags/$VERSION"
+      - name: Create draft release (manual review still required)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+        run: gh release create "$VERSION" dist/* --verify-tag --draft --title "$VERSION" --notes "Precompiled native binaries with SHA256SUMS. Unsigned; macOS notarization and Windows code signing are not implemented. SDK packages have independent release lifecycles."
