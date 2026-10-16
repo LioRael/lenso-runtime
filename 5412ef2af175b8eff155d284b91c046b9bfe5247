@@ -1,0 +1,14 @@
+scripts/package-release.py
+  h_9d56aba080c170 18-19
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "5412ef2af175b8eff155d284b91c046b9bfe5247",
+  "prompts": {},
+  "humans": {
+    "h_9d56aba080c170": {
+      "author": "LioRael <leo@lenso.dev>"
+    }
+  }
+}
