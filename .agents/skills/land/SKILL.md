@@ -5,6 +5,7 @@ user-invocable: true
 disable-model-invocation: true
 metadata:
   delta-action: land
+  internal: true
 ---
 
 # Land Runtime changes
@@ -47,6 +48,12 @@ direct-push or PR route are recorded; publication of source is authorized.
 ## 2. Form one clean candidate
 
 Create a uniquely named local integration branch from the fetched destination.
+Choose its prefix for the policy route below.
+`Source checks` runs on `main`, `land/**`, version tags, PRs and manual dispatch; ordinary
+feature branches use the PR event so one push does not run the full suite twice.
+For a PR route, keep the PR source on an ordinary feature branch instead; reserve
+`land/**` for a direct route needing branch CI. A PR from `land/**` intentionally
+runs both events and is not a reason to omit policy-required evidence.
 Integrate the pinned source without modifying the source branch or advancing
 the destination. Respect linear-history rules when choosing integration.
 Resolve conflicts only when combined intent is clear, preserving unrelated
@@ -82,20 +89,36 @@ For kernel, protocol, SDK, generator or example behavior changes, the existing
 standalone verification is:
 
 ```sh
-bun run build
-bun run test
+bun run build:sdk
+bun run generate
 bun run typecheck
+bun test sdk/typescript tools scripts
+cargo test --workspace --locked
+cargo build --workspace --locked
 cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
 bun run smoke
 ```
 
-`build` includes contract generation and native binaries; `test` includes Rust
-and TS SDK tests. Confirm generated artifacts reproduce and both lockfiles stay
-unchanged. Inspect affected tests and add only concrete missing regressions.
+These commands build the SDK once and reuse Cargo artifacts across the generated
+Rust integration fixture and workspace checks. Also run the Python SDK tests for
+kernel, protocol, transport or Python changes: install `./sdk/python[websocket]`
+into an owned virtual environment and run
+`python -W error -m unittest discover -s sdk/python/tests -v` with that environment.
+CI always runs these cross-language checks. Confirm generated artifacts reproduce
+and both lockfiles stay unchanged. Inspect affected tests and add only concrete missing regressions.
 Use `cargo fmt --all --check` for changed Rust source. Documentation/skill-only
 changes need frontmatter, local-link, Markdown and diff validation, not unrelated
 runtime builds. Performance evidence is required only for requested performance
 changes or claims; use the existing `perf` entry rather than inventing benchmarks.
+
+Reuse successful local evidence only when the full candidate SHA, dependency
+lock hashes, toolchain, command/options and environment match. Record the evidence
+and run missing checks; any source change or rebase invalidates affected evidence.
+Required remote checks remain mandatory for their exact policy revision. Changes
+only to CI/land/test selection need workflow validation and the affected test
+commands; do not run unrelated performance or five-platform release builds locally.
+For binary packaging or release workflow changes, retain all five native build,
+smoke and checksum jobs; a local host cannot establish the other targets.
 
 For affected TS application integration, inspect the existing
 `scripts/verify-lenso.ts` and the consuming repository's preparation/build
