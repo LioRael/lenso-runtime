@@ -223,6 +223,9 @@ function validateFrame(frame: Frame): void {
     throw error("protocol_error");
   for (const key of ["id", "method", "trace_id", "parent_id", "code", "message", "generation"])
     if (Object.hasOwn(frame, key) && typeof frame[key] !== "string") throw error("protocol_error");
+  if (frame.type === "error" &&
+      (!errorCodes.has(frame.code) || new TextEncoder().encode(frame.message).byteLength > 1024))
+    throw error("protocol_error");
   if (
     frame.type === "invoke" &&
     (!frame.caller ||

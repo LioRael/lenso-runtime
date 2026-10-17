@@ -289,7 +289,8 @@ class RuntimeHost:
                 raise ValueError("invalid route")
         if kind in {"result", "chunk"} and "output" not in f:
             raise ValueError("missing output")
-        if kind == "error" and (f.get("code") not in ERROR_CODES or type(f.get("message")) is not str):
+        if kind == "error" and (f.get("code") not in ERROR_CODES or type(f.get("message")) is not str
+                                or len(f["message"].encode("utf-8")) > 1024):
             raise ValueError("invalid error")
         if kind == "credit" and not _integer(f.get("credits"), 1, 16):
             raise ValueError("invalid credit")

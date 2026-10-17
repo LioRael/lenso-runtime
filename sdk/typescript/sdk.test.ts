@@ -868,3 +868,32 @@ test("invalid structured errors retire only their invocation and completion canc
   expect((await f.next("result")).output).toEqual({ value: 1 });
   expect(signal!.aborted).toBe(true);
 });
+
+for (const [code, message] of [["unknown", "private-message"], ["business", "é".repeat(513)]]) {
+  test(`malformed error envelope closes pending routes: ${code}`, async () => {
+    const f = await fixture();
+    const first = f.host.call(target, "unary", {});
+    const firstResult = first.catch((e) => e);
+    const call = await f.next("call");
+    const second = f.host.call(target, "unary", {});
+    const secondResult = second.catch((e) => e);
+    await f.next("call");
+    f.send({ type: "error", id: call.id, code, message, details: { secret: "private-details" } });
+    for (const failure of await Promise.all([firstResult, secondResult])) {
+      expect(failure).toBeInstanceOf(RuntimeError);
+      if (!(failure instanceof RuntimeError)) throw new Error("Expected RuntimeError");
+      expect(failure.code).toBe("protocol_error");
+      expect(failure.message).toBe("protocol_error");
+      expect(failure.details).toBeUndefined();
+    }
+    await f.host.whenClosed();
+  });
+}
+
+test("valid error messages retain the 1024 UTF-8 byte boundary", async () => {
+  const f = await fixture();
+  const pending = f.host.call(target, "unary", {});
+  const call = await f.next("call");
+  f.send({ type: "error", id: call.id, code: "cancelled", message: "é".repeat(512) });
+  await expect(pending).rejects.toMatchObject({ code: "cancelled", message: "é".repeat(512) });
+});

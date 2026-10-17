@@ -1183,6 +1183,12 @@ fn frame_error(frame: &Value) -> RuntimeError {
     }
 }
 fn validate_kernel_frame(frame: &Value) -> Result<(), RuntimeError> {
+    // Error envelopes have identical constraints in both wire directions.
+    // Reject malformed errors before exposing their message or details.
+    if frame["type"] == "error" {
+        return protocol::validate_host_frame(frame)
+            .map_err(|_| RuntimeError::new("protocol_error"));
+    }
     let object = frame
         .as_object()
         .ok_or_else(|| RuntimeError::new("protocol_error"))?;
@@ -1630,6 +1636,67 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn malformed_error_envelopes_retire_all_routes_without_details() {
+        for (code, message) in [
+            ("unknown", "private-message".to_owned()),
+            ("business", "é".repeat(513)),
+        ] {
+            let (host, mut peer) = fixture().await;
+            let mut pending = Vec::new();
+            let mut id = Value::Null;
+            for _ in 0..2 {
+                let caller = host.clone();
+                pending.push(tokio::spawn(async move {
+                    caller
+                        .call::<_, Value>(&target(), "unary", json!({}), CallOptions::default())
+                        .await
+                }));
+                id = next(&mut peer, "call").await["id"].clone();
+            }
+            write_frame(
+                &mut peer,
+                &json!({"type":"error", "id":id, "code":code,
+                "message":message, "details":{"secret":"private-details"}}),
+            )
+            .await
+            .unwrap();
+            for task in pending {
+                let failure = timeout(Duration::from_secs(2), task)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap_err();
+                assert_eq!(failure.code, "protocol_error");
+                assert_eq!(failure.message, "protocol_error");
+                assert_eq!(failure.details, None);
+            }
+            host.close();
+        }
+    }
+
+    #[test]
+    fn error_envelope_bounds_apply_before_and_after_registration() {
+        for id in [None, Some("1")] {
+            let mut frame = json!({"type":"error", "code":"cancelled", "message":"é".repeat(512)});
+            if let Some(id) = id {
+                frame["id"] = json!(id);
+            }
+            assert!(validate_kernel_frame(&frame).is_ok());
+            frame["message"] = json!("é".repeat(513));
+            assert_eq!(
+                validate_kernel_frame(&frame).unwrap_err().code,
+                "protocol_error"
+            );
+            frame["message"] = json!("safe");
+            frame["code"] = json!("unknown");
+            assert_eq!(
+                validate_kernel_frame(&frame).unwrap_err().code,
+                "protocol_error"
+            );
+        }
     }
 
     async fn fixture() -> (RuntimeHost, TcpStream) {
