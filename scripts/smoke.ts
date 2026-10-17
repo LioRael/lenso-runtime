@@ -198,6 +198,51 @@ try {
   await tsService.close();
   tsService = undefined;
 
+  // A real nested TS -> Rust route inherits the caller's budget and cancellation.
+  tsService = await RuntimeHost.connect({
+    namespace: "demo", service: "bridge", instance: "one", port: runtime.port,
+    contract: logsContract,
+    handlers: {
+      aggregate: (input, context) => new LogsClient(tsService!, { namespace: "demo", service: "batch" })
+        .aggregate(input, context.callOptions()),
+      progress: async function* (input, context) {
+        const options = context.callOptions();
+        await Bun.sleep(50); // Capturing options early must not reset the later child budget.
+        yield* new LogsClient(tsService!, { namespace: "demo", service: "batch" }).progress(input, options);
+      },
+    },
+  });
+  const bridge = new LogsClient(runtime.host, { namespace: "demo", service: "bridge" });
+  assert.deepEqual(await bridge.aggregate({ logs }), { count: 2, error_count: 1, total_duration_ms: 10 });
+  await expectCode(() => bridge.aggregate({ logs: [] }), "business");
+  const parentAbort = new AbortController();
+  const nested = bridge.progress({ logs, delay_ms: 1000 }, { timeoutMs: 2000, signal: parentAbort.signal, traceId: "nested-cancel" });
+  const nestedResult = expectCode(() => nested.next(), "cancelled");
+  let active: any[] = [];
+  const admissionLimit = performance.now() + 1500;
+  while (active.length !== 2) {
+    active = (await runtime.host.status()).calls.filter((c: any) => c.trace_id === "nested-cancel");
+    assert.ok(performance.now() < admissionLimit, "Nested routes did not become active");
+    if (active.length !== 2) await Bun.sleep(5);
+  }
+  const parent = active.find((c) => c.service === "bridge");
+  const child = active.find((c) => c.service === "batch");
+  assert.equal(child.parent_id, parent.id);
+  assert.ok(child.remaining_ms < 1950, "Child reset its deadline");
+  assert.ok(child.remaining_ms <= parent.remaining_ms + 10, "Child exceeded its parent's remaining budget");
+  parentAbort.abort();
+  await nestedResult;
+  const retirementLimit = performance.now() + 1000;
+  while ((await runtime.host.status()).calls.length) {
+    assert.ok(performance.now() < retirementLimit, "Cancellation left a nested route alive");
+    await Bun.sleep(5);
+  }
+  const inheritedDeadline = bridge.progress({ logs, delay_ms: 1000 }, { deadlineMs: performance.now() + 200, traceId: "nested-deadline" });
+  await expectCode(() => inheritedDeadline.next(), "deadline_exceeded");
+  await tsService.drain(1000);
+  await tsService.close();
+  tsService = undefined;
+
   const slow = client.progress({ logs, delay_ms: 100 }, { timeoutMs: 20 });
   await expectCode(() => slow.next(), "deadline_exceeded");
   const abort = new AbortController();
@@ -212,16 +257,22 @@ try {
   const snapshot = await runtime.host.status();
   assert.equal(snapshot.calls.length, 0);
 
-  const interrupted = client.progress({ logs, delay_ms: 1000 });
+  const interrupted = client.progress({ logs, delay_ms: 1000 }, { traceId: "disconnected-rust" });
   const pending = interrupted.next();
   runtime.batch.kill("SIGKILL");
   await runtime.batch.exited;
   await expectCode(() => pending, "connection_lost");
+  const disconnected = await runtime.host.status();
+  assert.equal(disconnected.calls.length, 0);
+  assert.equal(disconnected.services.some((s) => s.service === "batch"), false);
+  assert.ok(disconnected.recent?.some((c) => c.trace_id === "disconnected-rust" && c.code === "connection_lost"));
   console.log(
     JSON.stringify({
       smoke: "pass",
       checks: [
         "TS→kernel→Rust",
+        "nested deadline and active cancellation propagation",
+        "disconnect removes active routes and records terminal status",
         "Rust→kernel→TS",
         "Rust generated client",
         "generated clients",

@@ -31,10 +31,8 @@ async def main() -> None:
         event("prepare_started", context)
         completed = False
         try:
-            # Task cancellation propagates into the SDK's nested call future.
-            def options() -> dict:
-                remaining = int((context.deadline - asyncio.get_running_loop().time()) * 1000)
-                return dict(timeout_ms=max(1, remaining), trace_id=context.trace_id, parent_id=context.call_id)
+            # Inherit the remaining deadline, cancellation and trace at dispatch.
+            options = context.call_options
             policy = await GatewayClient(host, namespace=namespace, service="gateway").policy({}, **options())
             limits = await MetricsClient(host, namespace=namespace, service="metrics").limits({}, **options())
             if not input["lines"]:

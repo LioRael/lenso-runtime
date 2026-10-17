@@ -178,6 +178,27 @@ Timeout does not prove side effects did not finish. Cancellation is cooperative,
 not rollback. Drain gives in-flight work bounded time. Kernel restart fails
 in-flight calls; Hosts may reconnect/register/ready without replay.
 
+For nested calls, explicitly pass TS `context.callOptions()`, Rust
+`context.call_options()`, or Python `**context.call_options()`. These inherit
+the invocation's cancellation, trace ID, parent route ID and local monotonic
+deadline. Remaining time is recomputed at dispatch and capped by the requested
+timeout; an expired budget fails locally without sending a call. TS accepts
+optional `deadlineMs` in `performance.now()` units; Python accepts optional
+`deadline` in event-loop time units and `cancelled` (`asyncio.Event`). Rust offers
+`CallOptions::with_deadline(tokio::time::Instant)` and `context.deadline()`;
+the bound travels with its existing cancellation token, preserving public struct
+literals. These clocks are process-local: only the existing `timeout_ms` travels
+on the wire. No new v1 fields, negotiation or replay are introduced. Context
+cancellation also ends child work when the parent handler finishes. Go's existing
+SDK achieves deadline/cancellation inheritance by passing the handler context.
+
+Handler errors with unknown codes, messages over 1024 UTF-8 bytes or an oversized
+encoded error envelope become `invalid_output` for that route. They must not
+disconnect otherwise healthy calls. Valid business details retain schema
+validation. Active status describes kernel routes, not proof that cooperative
+business work has stopped; `recent` records the first terminal outcome, including
+`connection_lost`, without replay after reconnection.
+
 ## Single contract source
 
 Business-local JSON: `{"version":"1","methods":{"aggregate":{"mode":"unary",

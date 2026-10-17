@@ -27,6 +27,8 @@ export type PromoteOptions = {
 };
 export type CallOptions = {
   timeoutMs?: number;
+  /** Local monotonic deadline in performance.now() milliseconds; never sent on the wire. */
+  deadlineMs?: number;
   signal?: AbortSignal;
   traceId?: string;
   parentId?: string;
@@ -34,6 +36,9 @@ export type CallOptions = {
 };
 export type HandlerContext = {
   signal: AbortSignal;
+  deadlineMs: number;
+  /** Inherit this invocation's deadline, cancellation and trace for a child call. */
+  callOptions(): CallOptions;
   callId: string;
   traceId: string;
   parentId?: string;
@@ -115,6 +120,10 @@ type Invocation = {
 };
 const MAX_FRAME = MAX_PAYLOAD + 1;
 const error = (code: string) => new RuntimeError(code, code);
+const errorCodes = new Set([
+  "service_not_found", "not_ready", "overloaded", "deadline_exceeded", "connection_lost",
+  "cancelled", "contract_mismatch", "invalid_input", "invalid_output", "business", "protocol_error",
+]);
 function spend(budget: { remaining: number }, bytes: number): void {
   budget.remaining -= bytes;
   if (budget.remaining < 0) throw error("invalid_input");
@@ -515,8 +524,13 @@ export class RuntimeHost {
         throw error("invalid_input");
       }
     }
-    const timeout = options.timeoutMs ?? 5000;
+    let timeout = options.timeoutMs ?? 5000;
     if (!Number.isInteger(timeout) || timeout < 1 || timeout > 60000) throw error("invalid_input");
+    if (options.deadlineMs !== undefined) {
+      if (!Number.isFinite(options.deadlineMs)) throw error("invalid_input");
+      timeout = Math.min(timeout, Math.floor(options.deadlineMs - performance.now()));
+      if (timeout < 1) throw error("deadline_exceeded");
+    }
     if (!Number.isSafeInteger(this.sequence + 1)) throw error("overloaded");
     const id = String(++this.sequence);
     const cancel = (code: string) => {
@@ -686,6 +700,7 @@ export class RuntimeHost {
       stream: method?.mode === "stream",
     };
     this.invocations.set(frame.id, invocation);
+    const deadlineMs = performance.now() + frame.timeout_ms;
     const timer = setTimeout(() => {
       invocation.controller.abort(error("deadline_exceeded"));
       invocation.wake?.();
@@ -704,6 +719,10 @@ export class RuntimeHost {
       handlerWork = Promise.resolve(
         handler(frame.input, {
           signal,
+          deadlineMs,
+          callOptions: () => ({
+            deadlineMs, signal, traceId: frame.trace_id, parentId: frame.id,
+          }),
           callId: frame.id,
           traceId: frame.trace_id,
           parentId: frame.parent_id,
@@ -758,6 +777,8 @@ export class RuntimeHost {
     } catch (e) {
       if (this.phase !== "closed") {
         let failure = e instanceof RuntimeError ? e : error("invalid_output");
+        if (!errorCodes.has(failure.code) || Buffer.byteLength(failure.message) > 1024)
+          failure = error("invalid_output");
         if (failure.code === "business") {
           try {
             validateWireValue(failure.details);
@@ -766,16 +787,24 @@ export class RuntimeHost {
             failure = error("invalid_output");
           }
         }
-        this.send({
+        let response: Frame = {
           type: "error",
           id: frame.id,
           code: failure.code,
           message: failure.message,
           ...(failure.details === undefined ? {} : { details: failure.details }),
-        });
+        };
+        try {
+          validateWireValue(response, 0, undefined, true);
+        } catch {
+          response = { type: "error", id: frame.id, code: "invalid_output", message: "invalid_output" };
+        }
+        this.send(response);
       }
     } finally {
       clearTimeout(timer);
+      // Child work belongs to the invocation, including on successful completion.
+      invocation.controller.abort(error("cancelled"));
       invocation.wake = undefined;
       this.invocations.delete(frame.id);
       // Transport cancellation cannot release the permit of a still-running JS Promise.
