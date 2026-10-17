@@ -273,6 +273,49 @@ class KernelTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(ts.wait(), 5)
         self.assertEqual(ts.returncode, 0, (await ts.stderr.read()).decode())
 
+    async def test_inherited_deadline_and_idle_stream_cancellation(self):
+        from lenso_runtime import HandlerContext
+        loop = asyncio.get_running_loop()
+        cancelled = asyncio.Event()
+        context = HandlerContext("parent", "trace", None, {}, loop.time() + 0.25, cancelled)
+        options = context.call_options()
+        await asyncio.sleep(0.03)
+        stream = self.client.stream(TARGET, "progress", {"logs": LOGS, "delay_ms": 1000}, **options)
+        await self.assertCode(anext(stream), "deadline_exceeded")
+        await asyncio.wait_for(self.cancelled.wait(), 1)
+        self.assertFalse(self.client._pending)
+        self.started.clear()
+        self.cancelled.clear()
+        idle = self.client.stream(TARGET, "progress", {"logs": LOGS}, cancelled=cancelled)
+        cancelled.set()
+        # Cancellation must retire a stream even with no next() demand.
+        async with asyncio.timeout(1):
+            while self.client._pending:
+                await asyncio.sleep(0.005)
+        await self.assertCode(anext(idle), "cancelled")
+        await self.assertCode(self.client.call(TARGET, "aggregate", {"logs": LOGS}, **options), "cancelled")
+        before = self.client._sequence
+        await self.assertCode(self.client.call(TARGET, "aggregate", {"logs": LOGS}, deadline=loop.time()-1), "deadline_exceeded")
+        self.assertEqual(self.client._sequence, before)
+        for bad in (float("inf"), float("nan")):
+            await self.assertCode(self.client.call(TARGET, "aggregate", {"logs": LOGS}, deadline=bad), "invalid_input")
+        await self.assertCode(self.client.call(TARGET, "aggregate", {"logs": LOGS}, deadline=-1e308), "deadline_exceeded")
+        self.assertEqual(await self.client.call(TARGET, "aggregate", {"logs": LOGS}, deadline=1e308), EXPECTED)
+
+    async def test_error_message_limit_does_not_disconnect_service(self):
+        async def broken(input, context):
+            if not input["logs"]:
+                raise BusinessError({"reason": "safe"}, "界" * 400)
+            return EXPECTED
+        async def progress(input, context):
+            if False:
+                yield None
+        await self.connect("bounded-errors", contract=copy.deepcopy(CONTRACT),
+                           handlers={"aggregate": broken, "progress": progress})
+        target = Target("demo", "bounded-errors")
+        await self.assertCode(self.client.call(target, "aggregate", {"logs": []}), "invalid_output")
+        self.assertEqual(await self.client.call(target, "aggregate", {"logs": LOGS}), EXPECTED)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ import asyncio
 import inspect
 import ipaddress
 import json
+import math
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
@@ -45,6 +46,11 @@ class HandlerContext:
     deadline: float
     cancelled: asyncio.Event
 
+    def call_options(self) -> dict[str, Any]:
+        """Explicit child-call inheritance; the deadline uses the local loop clock."""
+        return {"deadline": self.deadline, "cancelled": self.cancelled,
+                "trace_id": self.trace_id, "parent_id": self.call_id}
+
 
 Handler = Callable[[Any, HandlerContext], Any]
 
@@ -55,6 +61,7 @@ class _Pending:
     method: Schema | None
     future: asyncio.Future[Any] | None = None
     timer: asyncio.TimerHandle | None = None
+    cancellation: asyncio.Task[None] | None = None
     ended: bool = False
     error: RuntimeError | None = None
     waiting: bool = False
@@ -63,6 +70,7 @@ class _Pending:
 @dataclass
 class _Invocation:
     stream: bool
+    deadline: float
     cancelled: asyncio.Event = field(default_factory=asyncio.Event)
     credit_ready: asyncio.Event = field(default_factory=asyncio.Event)
     credits: int = 0
@@ -369,6 +377,8 @@ class RuntimeHost:
         p.ended, p.error = True, error
         if p.timer:
             p.timer.cancel()
+        if p.cancellation is not None and p.cancellation is not asyncio.current_task():
+            p.cancellation.cancel()
         if p.future is not None and not p.future.done():
             if error:
                 p.future.set_exception(error)
@@ -392,7 +402,8 @@ class RuntimeHost:
             if ident in self._invocations:
                 raise RuntimeError("protocol_error")
             method = self._contract["methods"].get(f["method"])
-            inv = _Invocation(stream=method is not None and method["mode"] == "stream")
+            inv = _Invocation(stream=method is not None and method["mode"] == "stream",
+                              deadline=asyncio.get_running_loop().time() + f["timeout_ms"] / 1000)
             self._invocations[ident] = inv
             inv.task = self._spawn(self._invoke(f, inv))
             inv.task.add_done_callback(lambda _: self._invocations.pop(ident, None))
@@ -449,7 +460,8 @@ class RuntimeHost:
             raise RuntimeError("protocol_error")
 
     def _start(self, target: Target | None, method: str, input: Any, mode: str,
-               timeout_ms: int, contract: Schema | None, trace_id: str | None, parent_id: str | None) -> tuple[str, _Pending]:
+               timeout_ms: int, contract: Schema | None, trace_id: str | None, parent_id: str | None,
+               deadline: float | None = None, cancelled: asyncio.Event | None = None) -> tuple[str, _Pending]:
         if self._closed.is_set():
             raise RuntimeError("connection_lost")
         if not self._accepting:
@@ -460,6 +472,10 @@ class RuntimeHost:
         try:
             if not _integer(timeout_ms, 1, 60000):
                 raise ValueError("invalid timeout")
+            if deadline is not None and (type(deadline) not in (int, float) or not math.isfinite(deadline)):
+                raise ValueError("invalid deadline")
+            if cancelled is not None and not isinstance(cancelled, asyncio.Event):
+                raise ValueError("invalid cancellation event")
             if mode != "status":
                 if not all(_identifier(v) for v in (target.namespace, target.service, target.contract_version, method)):
                     raise ValueError("invalid target or method")
@@ -474,6 +490,14 @@ class RuntimeHost:
                 validate_value(contract["input"], input)
         except (ValueError, TypeError, AttributeError, KeyError, OverflowError, RecursionError) as exc:
             raise RuntimeError("invalid_input") from exc
+        loop = asyncio.get_running_loop()
+        if cancelled is not None and cancelled.is_set():
+            raise RuntimeError("cancelled")
+        if deadline is not None:
+            remaining = deadline - loop.time()
+            if remaining < 0.001:
+                raise RuntimeError("deadline_exceeded")
+            timeout_ms = math.floor(min(timeout_ms, remaining * 1000))
         self._sequence += 1
         ident = str(self._sequence)
         frame: dict[str, Any] = {"type": "status", "id": ident} if mode == "status" else {
@@ -484,15 +508,20 @@ class RuntimeHost:
         if parent_id is not None:
             frame["parent_id"] = parent_id
         self._send(frame)
-        loop = asyncio.get_running_loop()
         p = _Pending(mode, contract, future=loop.create_future() if mode != "stream" else None)
         p.timer = loop.call_later(timeout_ms / 1000, lambda: self._retire(ident, RuntimeError("deadline_exceeded"), cancel=mode != "status"))
         self._pending[ident] = p
+        if cancelled is not None:
+            async def watch_cancel() -> None:
+                await cancelled.wait()
+                self._retire(ident, RuntimeError("cancelled"), cancel=True)
+            p.cancellation = self._spawn(watch_cancel())
         return ident, p
 
     async def call(self, target: Target, method: str, input: Any, *, timeout_ms: int = 5000,
-                   contract: Schema | None = None, trace_id: str | None = None, parent_id: str | None = None) -> Any:
-        ident, p = self._start(target, method, input, "unary", timeout_ms, contract, trace_id, parent_id)
+                   contract: Schema | None = None, trace_id: str | None = None, parent_id: str | None = None,
+                   deadline: float | None = None, cancelled: asyncio.Event | None = None) -> Any:
+        ident, p = self._start(target, method, input, "unary", timeout_ms, contract, trace_id, parent_id, deadline, cancelled)
         try:
             assert p.future is not None
             return await p.future
@@ -501,8 +530,9 @@ class RuntimeHost:
             raise
 
     def stream(self, target: Target, method: str, input: Any, *, timeout_ms: int = 5000,
-               contract: Schema | None = None, trace_id: str | None = None, parent_id: str | None = None) -> ResponseStream:
-        ident, p = self._start(target, method, input, "stream", timeout_ms, contract, trace_id, parent_id)
+               contract: Schema | None = None, trace_id: str | None = None, parent_id: str | None = None,
+               deadline: float | None = None, cancelled: asyncio.Event | None = None) -> ResponseStream:
+        ident, p = self._start(target, method, input, "stream", timeout_ms, contract, trace_id, parent_id, deadline, cancelled)
         return ResponseStream(self, ident, p)
 
     async def status(self, *, timeout_ms: int = 5000) -> dict[str, Any]:
@@ -518,7 +548,7 @@ class RuntimeHost:
         ident, iterator = f["id"], None
         method = self._contract["methods"].get(f["method"])
         context = HandlerContext(ident, f["trace_id"], f.get("parent_id"), f["caller"],
-                                 asyncio.get_running_loop().time() + f["timeout_ms"] / 1000, inv.cancelled)
+                                 inv.deadline, inv.cancelled)
         try:
             async with asyncio.timeout_at(context.deadline):
                 if method is None:
@@ -562,7 +592,7 @@ class RuntimeHost:
                 error = (RuntimeError("cancelled") if isinstance(exc, asyncio.CancelledError)
                          else RuntimeError("deadline_exceeded") if isinstance(exc, TimeoutError)
                          else exc if isinstance(exc, RuntimeError) else RuntimeError("invalid_output"))
-                if error.code not in ERROR_CODES:
+                if error.code not in ERROR_CODES or len(str(error).encode("utf-8", errors="replace")) > 1024:
                     error = RuntimeError("invalid_output")
                 if error.code == "business":
                     try:

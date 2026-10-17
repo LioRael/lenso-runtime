@@ -800,3 +800,71 @@ test("generated streams distinguish method replacement from captured nested muta
     logsContract.methods.progress = original;
   }
 });
+
+test("child options retain an absolute budget and cancellation after handler entry", async () => {
+  let childOptions: import("@lenso/runtime-sdk").CallOptions | undefined;
+  let entered!: () => void;
+  const started = new Promise<void>((resolve) => { entered = resolve; });
+  const f = await fixture({ unary: async (_input, context) => {
+    childOptions = context.callOptions();
+    expect(context.deadlineMs).toBe(childOptions.deadlineMs!);
+    entered();
+    await new Promise<void>((resolve) => context.signal.addEventListener("abort", () => resolve(), { once: true }));
+    return { value: 1 };
+  } });
+  f.invoke("42", "unary", 2000);
+  await started;
+  await Bun.sleep(30);
+  const child = f.host.call(target, "unary", { value: 1 }, childOptions);
+  const frame = await f.next("call");
+  expect(frame.timeout_ms).toBeLessThan(1980);
+  expect(frame.timeout_ms).toBeGreaterThan(0);
+  expect(frame.parent_id).toBe("42");
+  expect(frame.trace_id).toBe(childOptions!.traceId!);
+  expect(frame.deadlineMs).toBeUndefined();
+  f.send({ type: "cancel", id: "42" });
+  await expect(child).rejects.toMatchObject({ code: "cancelled" });
+  expect((await f.next("cancel")).id).toBe(frame.id);
+});
+
+test("expired child budget sends no work; explicit deadline bounds unary and idle stream", async () => {
+  const f = await fixture();
+  await expect(f.host.call(target, "unary", { value: 1 }, { deadlineMs: performance.now() - 1 }))
+    .rejects.toMatchObject({ code: "deadline_exceeded" });
+  for (const deadlineMs of [NaN, Infinity])
+    await expect(f.host.call(target, "unary", { value: 1 }, { deadlineMs }))
+      .rejects.toMatchObject({ code: "invalid_input" });
+  const call = f.host.call(target, "unary", { value: 1 }, { deadlineMs: performance.now() + 100 });
+  const request = await f.next("call");
+  expect(request.id).toBe("1");
+  expect(request.timeout_ms).toBeLessThanOrEqual(100);
+  await expect(call).rejects.toMatchObject({ code: "deadline_exceeded" });
+  expect((await f.next("cancel")).id).toBe(request.id);
+  const stream = f.host.stream(target, "stream", { value: 1 }, { deadlineMs: performance.now() + 100 });
+  const streamRequest = await f.next("call");
+  expect((await f.next("cancel")).id).toBe(streamRequest.id);
+  await expect(stream.next()).rejects.toMatchObject({ code: "deadline_exceeded" });
+});
+
+test("invalid structured errors retire only their invocation and completion cancels child context", async () => {
+  let failure: RuntimeError | undefined;
+  let signal: AbortSignal | undefined;
+  const f = await fixture({ unary: (_input, context) => {
+    signal = context.signal;
+    if (failure) throw failure;
+    return { value: 1 };
+  } });
+  for (const reason of [new RuntimeError("made_up", "bad"), new RuntimeError("business", "界".repeat(400), { value: 1 }),
+    new RuntimeError("invalid_output", "bad", "x".repeat(262144))]) {
+    failure = reason;
+    f.invoke("42", "unary");
+    const response = await f.next("error");
+    expect(response.code).toBe("invalid_output");
+    expect(response.details).toBeUndefined();
+    expect(signal!.aborted).toBe(true);
+  }
+  failure = undefined;
+  f.invoke("43", "unary");
+  expect((await f.next("result")).output).toEqual({ value: 1 });
+  expect(signal!.aborted).toBe(true);
+});

@@ -16,12 +16,7 @@ mod cleaner {
 }
 
 fn child_options(context: &HandlerContext) -> CallOptions {
-    CallOptions {
-        timeout_ms: 5000,
-        cancellation: Some(context.cancellation.clone()),
-        trace_id: Some(context.trace_id.clone()),
-        parent_id: Some(context.call_id.clone()),
-    }
+    context.call_options()
 }
 
 // Drop also runs when the SDK aborts a cancelled handler. This is application

@@ -100,6 +100,7 @@ pub struct BusinessError<E>(pub E);
 #[derive(Clone)]
 pub struct Cancellation {
     sender: watch::Sender<bool>,
+    deadline: Option<Instant>,
 }
 impl Default for Cancellation {
     fn default() -> Self {
@@ -109,7 +110,18 @@ impl Default for Cancellation {
 impl Cancellation {
     pub fn new() -> Self {
         let (sender, _) = watch::channel(false);
-        Self { sender }
+        Self {
+            sender,
+            deadline: None,
+        }
+    }
+    /// Tighten this token's local deadline without replacing its cancellation signal.
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(self.deadline.map_or(deadline, |old| old.min(deadline)));
+        self
+    }
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
     }
     pub fn cancel(&self) {
         self.sender.send_replace(true);
@@ -132,6 +144,21 @@ pub struct HandlerContext {
     pub trace_id: String,
     pub parent_id: Option<String>,
     pub caller: Value,
+}
+impl HandlerContext {
+    /// Runtime invocations always have a local monotonic deadline.
+    pub fn deadline(&self) -> Option<Instant> {
+        self.cancellation.deadline()
+    }
+    /// Explicit child-call inheritance. The remaining budget is computed at dispatch.
+    pub fn call_options(&self) -> CallOptions {
+        CallOptions {
+            cancellation: Some(self.cancellation.clone()),
+            trace_id: Some(self.trace_id.clone()),
+            parent_id: Some(self.call_id.clone()),
+            ..CallOptions::default()
+        }
+    }
 }
 pub struct HostOptions {
     pub namespace: String,
@@ -196,6 +223,17 @@ impl Default for CallOptions {
             trace_id: None,
             parent_id: None,
         }
+    }
+}
+impl CallOptions {
+    /// Bound dispatch by a local deadline while retaining the existing cancellation signal.
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.cancellation = Some(
+            self.cancellation
+                .unwrap_or_default()
+                .with_deadline(deadline),
+        );
+        self
     }
 }
 type HandlerFuture = Pin<Box<dyn Future<Output = Result<Option<Value>, RuntimeError>> + Send>>;
@@ -760,6 +798,19 @@ impl RuntimeHost {
         {
             return Err(RuntimeError::new("cancelled"));
         }
+        let now = Instant::now();
+        let deadline = options
+            .cancellation
+            .as_ref()
+            .and_then(Cancellation::deadline)
+            .map_or(
+                now + Duration::from_millis(options.timeout_ms),
+                |deadline| deadline.min(now + Duration::from_millis(options.timeout_ms)),
+            );
+        let timeout_ms = deadline.saturating_duration_since(now).as_millis() as u64;
+        if timeout_ms == 0 {
+            return Err(RuntimeError::new("deadline_exceeded"));
+        }
         let id = self
             .inner
             .sequence
@@ -781,7 +832,7 @@ impl RuntimeHost {
                 },
             );
         }
-        let mut frame = json!({"type":"call","id":id,"namespace":target.namespace,"service":target.service,"method":method,"contract_version":target.contract_version,"input":input,"timeout_ms":options.timeout_ms});
+        let mut frame = json!({"type":"call","id":id,"namespace":target.namespace,"service":target.service,"method":method,"contract_version":target.contract_version,"input":input,"timeout_ms":timeout_ms});
         if let Some(trace) = &options.trace_id {
             frame["trace_id"] = trace.clone().into();
         }
@@ -795,13 +846,12 @@ impl RuntimeHost {
         let inner = self.inner.clone();
         let deadline_id = id.clone();
         let cancellation = options.cancellation.clone().unwrap_or_default();
-        let deadline = Duration::from_millis(options.timeout_ms);
         tokio::spawn(async move {
             let error = tokio::select! {
                 _ = inner.closed.cancelled() => return,
                 _ = completed.cancelled() => return,
                 _ = cancellation.cancelled() => RuntimeError::new("cancelled"),
-                _ = tokio::time::sleep(deadline) => RuntimeError::new("deadline_exceeded"),
+                _ = tokio::time::sleep_until(deadline) => RuntimeError::new("deadline_exceeded"),
             };
             inner.terminate(&deadline_id, error);
         });
@@ -1252,8 +1302,9 @@ fn receive(inner: &Arc<Inner>, frame: Value, options: &HostOptions) -> Result<()
                 .as_u64()
                 .filter(|n| (1..=60000).contains(n))
                 .ok_or_else(|| RuntimeError::new("protocol_error"))?;
+            let deadline = Instant::now() + Duration::from_millis(deadline);
             let context = HandlerContext {
-                cancellation: Cancellation::new(),
+                cancellation: Cancellation::new().with_deadline(deadline),
                 call_id: id.to_string(),
                 trace_id: frame["trace_id"]
                     .as_str()
@@ -1324,7 +1375,7 @@ fn receive(inner: &Arc<Inner>, frame: Value, options: &HostOptions) -> Result<()
                     }
                 };
                 let result = tokio::select! {
-                    result = timeout_at(Instant::now() + Duration::from_millis(deadline), operation) => result.unwrap_or_else(|_| Err(RuntimeError::new("deadline_exceeded"))),
+                    result = timeout_at(deadline, operation) => result.unwrap_or_else(|_| Err(RuntimeError::new("deadline_exceeded"))),
                     _ = context.cancellation.cancelled() => Err(RuntimeError::new("cancelled")),
                 };
                 if let Err(mut error) = result {
@@ -1341,7 +1392,19 @@ fn receive(inner: &Arc<Inner>, frame: Value, options: &HostOptions) -> Result<()
                     if let Some(details) = error.details {
                         response["details"] = details;
                     }
-                    let _ = inner.send(response);
+                    if protocol::validate_host_frame(&response).is_err() {
+                        response = json!({"type":"error","id":id,"code":"invalid_output","message":"invalid_output"});
+                    }
+                    let sent = inner.send(response).or_else(|error| {
+                        if error.code == "invalid_output" {
+                            inner.send(json!({"type":"error","id":id,"code":"invalid_output","message":"invalid_output"}))
+                        } else {
+                            Err(error)
+                        }
+                    });
+                    if sent.is_err() {
+                        inner.fail(RuntimeError::new("connection_lost"));
+                    }
                 }
             });
         }
@@ -2648,5 +2711,114 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(result.code, "connection_lost");
+    }
+    #[tokio::test]
+    async fn inherited_deadline_is_not_reset_and_cancellation_retires_child() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut handlers = Handlers::new();
+        handlers.unary::<Value, Value, Value, _, _>("work", move |_, context| {
+            tx.send(context).unwrap();
+            std::future::pending()
+        });
+        let contract = json!({"version":"1","methods":{"work":{"mode":"unary","input":{"type":"null"},"output":{"type":"null"},"error":{"type":"null"}}}});
+        let (host, mut peer) = fixture_with(handlers, contract).await;
+        write_frame(&mut peer, &json!({"type":"invoke","id":"42","method":"work","input":null,"timeout_ms":2000,"trace_id":"trace","caller":{"namespace":"demo","service":"caller","instance":"one"}})).await.unwrap();
+        let context = rx.recv().await.unwrap();
+        assert!(context.deadline().unwrap() > Instant::now());
+        let options = context.call_options();
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        let caller = host.clone();
+        let child = tokio::spawn(async move {
+            caller
+                .call::<_, Value>(&target(), "count", Value::Null, options)
+                .await
+        });
+        let frame = next(&mut peer, "call").await;
+        assert!(frame["timeout_ms"].as_u64().unwrap() < 1980);
+        assert_eq!(frame["parent_id"], "42");
+        assert_eq!(frame["trace_id"], "trace");
+        assert!(frame.get("deadline").is_none());
+        write_frame(&mut peer, &json!({"type":"cancel","id":"42"}))
+            .await
+            .unwrap();
+        assert_eq!(child.await.unwrap().unwrap_err().code, "cancelled");
+        loop {
+            let response = timeout(Duration::from_secs(1), read_frame(&mut peer))
+                .await
+                .unwrap()
+                .unwrap();
+            if response["type"] == "cancel" {
+                assert_eq!(response["id"], frame["id"]);
+                break;
+            }
+            assert!(
+                response["type"] == "heartbeat"
+                    || (response["type"] == "error" && response["id"] == "42")
+            );
+        }
+        assert!(context.cancellation.is_cancelled());
+        host.close();
+    }
+
+    #[tokio::test]
+    async fn expired_deadline_admits_no_work_and_idle_stream_uses_absolute_budget() {
+        let (host, mut peer) = fixture().await;
+        let result = host
+            .call::<_, Value>(
+                &target(),
+                "count",
+                Value::Null,
+                CallOptions::default().with_deadline(Instant::now() - Duration::from_millis(1)),
+            )
+            .await;
+        assert_eq!(result.unwrap_err().code, "deadline_exceeded");
+        let mut stream = host
+            .stream::<_, Value>(
+                &target(),
+                "stream",
+                Value::Null,
+                CallOptions::default().with_deadline(Instant::now() + Duration::from_millis(100)),
+            )
+            .unwrap();
+        let frame = next(&mut peer, "call").await;
+        assert_eq!(frame["id"], "1");
+        assert!(frame["timeout_ms"].as_u64().unwrap() <= 100);
+        assert_eq!(next(&mut peer, "cancel").await["id"], frame["id"]);
+        assert_eq!(stream.next().await.unwrap_err().code, "deadline_exceeded");
+        assert!(stream.next().await.unwrap().is_none());
+        host.close();
+    }
+
+    #[tokio::test]
+    async fn invalid_handler_errors_are_bounded_without_losing_the_session() {
+        let mut handlers = Handlers::new();
+        handlers.stream::<u64, Value, _, _>("work", |case, _, _| async move {
+            match case {
+                0 => Err(RuntimeError::new("made_up")),
+                1 => Err(RuntimeError {
+                    code: "business".into(),
+                    message: "界".repeat(400),
+                    details: Some(Value::Null),
+                }),
+                2 => Err(RuntimeError {
+                    code: "invalid_output".into(),
+                    message: "safe".into(),
+                    details: Some(json!("x".repeat(protocol::MAX_FRAME_BYTES))),
+                }),
+                _ => Ok(()),
+            }
+        });
+        let contract = json!({"version":"1","methods":{"work":{"mode":"stream","input":{"type":"integer"},"output":{"type":"null"},"error":{"type":"null"}}}});
+        let (host, mut peer) = fixture_with(handlers, contract).await;
+        for case in 0..4 {
+            write_frame(&mut peer, &json!({"type":"invoke","id":(case+1).to_string(),"method":"work","input":case,"timeout_ms":1000,"trace_id":"trace","caller":{"namespace":"demo","service":"caller","instance":"one"}})).await.unwrap();
+            let frame = next(&mut peer, if case == 3 { "end" } else { "error" }).await;
+            if case < 3 {
+                assert_eq!(frame["code"], "invalid_output");
+                assert!(frame.get("details").is_none());
+            }
+        }
+        assert!(!host.inner.closed.is_cancelled());
+        host.close();
     }
 }
