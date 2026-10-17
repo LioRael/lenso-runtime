@@ -120,6 +120,13 @@ Error codes: `service_not_found`, `not_ready`, `overloaded`, `deadline_exceeded`
 can omit `id`, and close the connection. Business details validate against the
 method error schema.
 
+SDK receivers reject unknown error codes and messages longer than 1024 UTF-8
+bytes as `protocol_error`, before exposing peer messages or details. This applies
+to handshake errors without an ID as well as call errors. A malformed envelope
+fails the connection and all pending work; a valid error remains scoped to its
+call. A missing exported method and a missing requested contract version both
+remain `contract_mismatch`; no new error code or version negotiation is added.
+
 ## Bounds and semantics
 
 Defaults: 128 connections, 64 active calls, 128 waiting calls, 64 outbound frames

@@ -91,6 +91,20 @@ class PeerTests(unittest.IsolatedAsyncioTestCase):
         await self.host.wait_closed()
         self.assertEqual(self.host._pending, {})
 
+    async def test_oversized_error_message_retires_all_routes_without_details(self):
+        first, ident = await self.call()
+        second, _ = await self.call()
+        await self.send({"type": "error", "id": ident, "code": "business",
+                         "message": "é" * 513, "details": {"secret": "private-details"}})
+        failures = await asyncio.gather(first, second, return_exceptions=True)
+        for failure in failures:
+            self.assertIsInstance(failure, RuntimeError)
+            self.assertEqual(failure.code, "protocol_error")
+            self.assertEqual(str(failure), "protocol_error")
+            self.assertIsNone(failure.details)
+        await self.host.wait_closed()
+        self.assertEqual(self.host._pending, {})
+
     async def test_chunk_without_demand_is_protocol_error(self):
         stream = self.host.stream(TARGET, "stream", None)
         frame = await self.read()
@@ -195,6 +209,14 @@ class FrameTests(unittest.TestCase):
         with patch("lenso_runtime.session.json.dumps", side_effect=AssertionError("must not encode")):
             with self.assertRaises(RuntimeError):
                 _encode({"type": "chunk", "id": "1", "output": "x" * (MAX_FRAME + 1)})
+
+    def test_error_message_utf8_boundary(self):
+        for ident in ({}, {"id": "1"}):
+            frame = {"type": "error", "code": "cancelled", "message": "é" * 512, **ident}
+            RuntimeHost._validate_frame(frame)
+            frame["message"] += "é"
+            with self.assertRaises(ValueError):
+                RuntimeHost._validate_frame(frame)
 
     def test_unknown_and_malformed_envelopes(self):
         for frame in ({"type": "bogus"}, {"type": "ready", "extra": 1},
