@@ -1,0 +1,40 @@
+PROTOCOL.md
+  h_9d56aba080c170 181-201
+crates/sdk/src/lib.rs
+  h_9d56aba080c170 103,113-124,148-162,228-238,801-813,835,854,1305,1307,1378,1395-1407,2715-2823
+examples/generated/logs.py
+  h_9d56aba080c170 4,56-57,59-60
+examples/polyglot-insights/cleaner.py
+  h_9d56aba080c170 34-35
+examples/polyglot-insights/generated/cleaner.py
+  h_9d56aba080c170 4,54-55,57-58
+examples/polyglot-insights/generated/gateway.py
+  h_9d56aba080c170 4,29-30
+examples/polyglot-insights/generated/metrics.py
+  h_9d56aba080c170 4,55-56,58-59
+examples/polyglot-insights/rust/src/main.rs
+  h_9d56aba080c170 19
+scripts/smoke.ts
+  h_9d56aba080c170 201-245,260,265-268,274-275
+sdk/python/src/lenso_runtime/generate.py
+  h_9d56aba080c170 70,72,80
+sdk/python/src/lenso_runtime/session.py
+  h_9d56aba080c170 8,49-53,64,73,380-381,405-406,463-464,475-478,493-500,514-518,522-524,533-535,551,595
+sdk/python/tests/test_runtime.py
+  h_9d56aba080c170 276-318
+sdk/typescript/index.ts
+  h_9d56aba080c170 30-31,39-41,123-126,527,529-533,703,722-725,780-781,790,796-802,806-807
+sdk/typescript/sdk.test.ts
+  h_9d56aba080c170 803-870
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "9fdd95a1260694dd94a98a07542d4392adb30f1e",
+  "prompts": {},
+  "humans": {
+    "h_9d56aba080c170": {
+      "author": "LioRael <leo@lenso.dev>"
+    }
+  }
+}
