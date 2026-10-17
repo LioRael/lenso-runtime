@@ -1,0 +1,34 @@
+PROTOCOL.md
+  h_9d56aba080c170 123-129
+crates/sdk/examples/error_probe.rs
+  h_9d56aba080c170 1-110
+crates/sdk/src/lib.rs
+  h_9d56aba080c170 1186-1191,1641-1701
+docs/SDK_ERROR_VERIFICATION.md
+  h_9d56aba080c170 1-78
+scripts/sdk-error-probes/client.ts
+  h_9d56aba080c170 1-21
+scripts/sdk-error-probes/main.go
+  h_9d56aba080c170 1-63
+scripts/sdk-error-probes/run.py
+  h_9d56aba080c170 1-121
+sdk/python/src/lenso_runtime/session.py
+  h_9d56aba080c170 292-293
+sdk/python/tests/test_transport.py
+  h_9d56aba080c170 94-107,213-220
+sdk/typescript/index.ts
+  h_9d56aba080c170 226-228
+sdk/typescript/sdk.test.ts
+  h_9d56aba080c170 871-899
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "17424b992f94bb4dd35d6834da2046caa033d4b3",
+  "prompts": {},
+  "humans": {
+    "h_9d56aba080c170": {
+      "author": "LioRael <leo@lenso.dev>"
+    }
+  }
+}
