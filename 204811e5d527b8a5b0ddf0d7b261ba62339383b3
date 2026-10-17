@@ -1,0 +1,30 @@
+examples/polyglot-insights/evidence/README.md
+  h_9d56aba080c170 3-5
+examples/polyglot-insights/evidence/fault-suite/cleaner-restarted.log
+  h_9d56aba080c170 1
+examples/polyglot-insights/evidence/fault-suite/cleaner.log
+  h_9d56aba080c170 1
+examples/polyglot-insights/evidence/fault-suite/evidence.json
+  h_9d56aba080c170 16-17
+examples/polyglot-insights/evidence/normal-run/cleaner.log
+  h_9d56aba080c170 1
+examples/polyglot-insights/evidence/normal-run/evidence.json
+  h_9d56aba080c170 16-17
+tools/contract-check.test.ts
+  h_9d56aba080c170 172-173,175,179,181-185,212-214
+tools/contract-check/index.ts
+  h_9d56aba080c170 1,104,175,178-180,193,196-200
+tools/generate.ts
+  h_9d56aba080c170 13,105,113
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "204811e5d527b8a5b0ddf0d7b261ba62339383b3",
+  "prompts": {},
+  "humans": {
+    "h_9d56aba080c170": {
+      "author": "LioRael <leo@lenso.dev>"
+    }
+  }
+}

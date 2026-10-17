@@ -1,0 +1,22 @@
+.agents/skills/land/SKILL.md
+  h_9d56aba080c170 8,51-56,92-93,95-97,102-108,114-122
+.github/workflows/check.yml
+  h_9d56aba080c170 2-7,25
+AGENTS.md
+  h_9d56aba080c170 1-26
+sdk/typescript/schema.test.ts
+  h_9d56aba080c170 2
+tools/generate.test.ts
+  h_9d56aba080c170 160-162,169
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "3b7e6c52b0aa201a63a97d4baeea3f4232365a66",
+  "prompts": {},
+  "humans": {
+    "h_9d56aba080c170": {
+      "author": "LioRael <leo@lenso.dev>"
+    }
+  }
+}
