@@ -7,7 +7,7 @@ on:
       version:
         description: Exact existing source tag (must match Cargo version to publish)
         required: true
-        default: v0.1.0
+        default: v0.1.1
       publish:
         description: Create a draft release from the selected tag after all native smoke checks
         type: boolean
@@ -40,7 +40,7 @@ jobs:
         run: python scripts/smoke-binary.py target/${{ matrix.target }}/release/lenso-runtime${{ matrix.suffix }}
       - name: Package versioned binary and checksum
         env:
-          RELEASE_VERSION: ${{ inputs.version || 'v0.1.0' }}
+          RELEASE_VERSION: ${{ inputs.version || 'v0.1.1' }}
         shell: bash
         run: python scripts/package-release.py --binary target/${{ matrix.target }}/release/lenso-runtime${{ matrix.suffix }} --target ${{ matrix.target }} --version "$RELEASE_VERSION" --output dist
       - uses: actions/upload-artifact@v4
