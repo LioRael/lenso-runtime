@@ -1,0 +1,18 @@
+.github/workflows/binaries.yml
+  h_9d56aba080c170 10,43
+Cargo.lock
+  h_9d56aba080c170 160
+crates/kernel/Cargo.toml
+  h_9d56aba080c170 3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "a612d15962243d7a6d479e619f0e6d588c87a301",
+  "prompts": {},
+  "humans": {
+    "h_9d56aba080c170": {
+      "author": "LioRael <leo@lenso.dev>"
+    }
+  }
+}
