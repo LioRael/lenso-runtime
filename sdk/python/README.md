@@ -7,8 +7,8 @@ port the Lenso framework or introduce another protocol or identity mechanism.
 
 Requires Python 3.11+. Supported transports are **numeric loopback TCP**
 (`127.0.0.1` or `::1`), **owned Unix stdio**, and optional **loopback WebSocket**.
-Remote connections, automatic reconnect/replay, promotion and deferred
-ready/activation are not implemented.
+Remote connections, automatic reconnect/replay and promotion are not implemented.
+Native App owners can register first and explicitly activate after setup.
 No production networking, credentials, publication or deployment is involved.
 
 ## Install and generate
@@ -146,6 +146,28 @@ cannot forcibly stop code that blocks the loop or suppresses cancellation. Close
 reports `deadline_exceeded` if a handler ignores cancellation, retains ownership
 of the unfinished task, and never claims that work has stopped. Cancellation
 suppression can retain a concurrency permit until the handler exits.
+
+## Deferred native activation
+
+`RuntimeHost.connect()` preserves immediate-ready behavior. Native App owners use
+`await RuntimeHost.connect_registered(...)`, which completes hello/register and
+starts session I/O/heartbeat without sending ready. Outbound clients and status
+are available while registered; inbound work is rejected until activation.
+
+Pass the contract up front, then call `host.bind_exports(handlers)` after native
+setup. Bindings must exactly match its methods; duplicate/missing/unexpected
+methods must be rejected by the owner before activation. `await host.activate()`
+shares one ready/ACK operation across waiters. Binding changes after activation
+starts and activation after drain/close are rejected. Cancelling activation
+retires the connection because a transmitted ready has an uncertain outcome.
+There is no reconnect or replay. Registration snapshots contract and handlers.
+
+On setup/binding failure close the registered connection. On normal shutdown or
+an uncertain activation outcome, drain before releasing native resources, then
+close the connection. The native `lenso-python` candidate's `RuntimeApp` owns
+this ordering; plain SDK use must own it explicitly. Existing transports and the
+v1 wire contract are unchanged. These APIs are source-candidate features until
+separately released.
 
 ## Bounds and checks
 

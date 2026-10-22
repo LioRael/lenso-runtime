@@ -52,7 +52,9 @@ The [Python SDK](sdk/python/README.md) adds typed asyncio clients and ordinary
 Python service functions over existing v1 **loopback TCP, owned Unix stdio and optional loopback WebSocket**. It uses
 the same JSON contracts and Rust kernel; TS/Rust plugin composition stays native.
 See [the Python examples](examples/python/) for bidirectional interoperability and
-[verification evidence](examples/python/VERIFICATION.md). Python remote mode, promotion and deferred activation are not implemented.
+[verification evidence](examples/python/VERIFICATION.md). Python remote mode and promotion are not implemented. The Python SDK supports
+registered connections, explicit export binding and activation after native setup;
+see its lifecycle section.
 
 ## Mixed local transports
 

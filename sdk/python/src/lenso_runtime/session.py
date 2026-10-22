@@ -158,7 +158,7 @@ _CONNECT = object()
 class RuntimeHost:
     def __init__(self, *, _token: object | None = None) -> None:
         if _token is not _CONNECT:
-            raise TypeError("Use await RuntimeHost.connect(...)")
+            raise TypeError("Use await RuntimeHost.connect(...) or connect_registered(...)")
         self._contract: Contract = {"version": "1", "methods": {}}
         self._handlers: dict[str, Handler] = {}
         self._max_concurrency = 8
@@ -167,18 +167,22 @@ class RuntimeHost:
         self._sequence = 0
         self._closed = asyncio.Event()
         self._accepting = False
+        self._ready = False
         self._queue: asyncio.Queue[tuple[float, bytes]] = asyncio.Queue(maxsize=64)
         self._tasks: set[asyncio.Task[Any]] = set()
+        self._activation: asyncio.Future[None] | None = None
+        self._activation_task: asyncio.Task[None] | None = None
         self._drained: asyncio.Future[None] | None = None
         self._close_task: asyncio.Task[None] | None = None
         self._drain_task: asyncio.Task[None] | None = None
         self._transport: MessageTransport
 
     @classmethod
-    async def connect(cls, *, namespace: str, service: str, instance: str,
+    async def connect_registered(cls, *, namespace: str, service: str, instance: str,
                       contract: Contract | None = None, handlers: dict[str, Handler] | None = None,
                       host: str = "127.0.0.1", port: int = 7331,
                       max_concurrency: int = 8, transport: str = "tcp", url: str | None = None) -> RuntimeHost:
+        """Register and start I/O without ready; bind exports then activate after setup."""
         contract = contract if contract is not None else {"version": "1", "methods": {}}
         handlers = handlers if handlers is not None else {}
         try:
@@ -193,12 +197,12 @@ class RuntimeHost:
                 websocket_address(url)
             if not _integer(max_concurrency, 1, 64):
                 raise ValueError("invalid concurrency")
-            if set(handlers) != set(contract["methods"]) or not all(callable(h) for h in handlers.values()):
+            if handlers and (set(handlers) != set(contract["methods"]) or not all(callable(h) for h in handlers.values())):
                 raise ValueError("bindings must exactly match contract")
         except (ValueError, TypeError, UnicodeError) as exc:
             raise RuntimeError("invalid_input", str(exc)) from exc
         self = cls(_token=_CONNECT)
-        self._contract, self._handlers = contract, handlers
+        self._contract, self._handlers = json.loads(json.dumps(contract)), dict(handlers)
         self._max_concurrency = max_concurrency
         try:
             async with asyncio.timeout(5):
@@ -214,10 +218,8 @@ class RuntimeHost:
                 self._expect(welcome, "welcome")
                 if not _integer(welcome.get("version"), 1, 1) or not _route(welcome.get("generation")) or not _integer(welcome.get("heartbeat_ms"), 1, 5000):
                     raise RuntimeError("protocol_error")
-                await self._send_direct({"type": "register", "contract": contract, "max_concurrency": max_concurrency})
+                await self._send_direct({"type": "register", "contract": self._contract, "max_concurrency": max_concurrency})
                 self._expect(await self._read_frame(), "registered")
-                await self._send_direct({"type": "ready"})
-                self._expect(await self._read_frame(), "ready")
             self._accepting = True
             self._spawn(self._read_loop())
             self._spawn(self._write_loop())
@@ -233,6 +235,75 @@ class RuntimeHost:
             if isinstance(exc, OSError):
                 raise RuntimeError("connection_lost") from exc
             raise
+
+    @classmethod
+    async def connect(cls, *, namespace: str, service: str, instance: str,
+                      contract: Contract | None = None, handlers: dict[str, Handler] | None = None,
+                      host: str = "127.0.0.1", port: int = 7331,
+                      max_concurrency: int = 8, transport: str = "tcp", url: str | None = None) -> RuntimeHost:
+        """Register and activate immediately; native Apps use connect_registered."""
+        # Keep immediate-connect validation resource-free and backwards compatible.
+        try:
+            validate_contract(contract if contract is not None else {"version": "1", "methods": {}})
+        except (ValueError, TypeError) as exc:
+            raise RuntimeError("invalid_input", str(exc)) from exc
+        if set(handlers or {}) != set((contract if contract is not None else {"methods": {}})["methods"]):
+            raise RuntimeError("invalid_input", "bindings must exactly match contract")
+        self: RuntimeHost | None = None
+        try:
+            async with asyncio.timeout(5):
+                self = await cls.connect_registered(namespace=namespace, service=service, instance=instance,
+                    contract=contract, handlers=handlers, host=host, port=port,
+                    max_concurrency=max_concurrency, transport=transport, url=url)
+                await self.activate()
+                return self
+        except BaseException as exc:
+            if self is not None:
+                await self.close()
+            if isinstance(exc, TimeoutError):
+                raise RuntimeError("deadline_exceeded", "Handshake timed out") from exc
+            raise
+
+    def bind_exports(self, handlers: dict[str, Handler]) -> None:
+        """Bind exactly the registered methods before activation, without setup."""
+        if self._closed.is_set() or self._activation_task is not None or self._drain_task is not None:
+            raise RuntimeError("not_ready", "Export binding is closed")
+        if set(handlers) != set(self._contract["methods"]) or not all(callable(h) for h in handlers.values()):
+            raise RuntimeError("invalid_input", "bindings must exactly match contract")
+        self._handlers = dict(handlers)
+
+    async def activate(self) -> None:
+        if self._closed.is_set() or self._drain_task is not None:
+            raise RuntimeError("not_ready")
+        if self._ready:
+            return
+        if self._activation_task is None:
+            self.bind_exports(self._handlers)
+            self._activation_task = asyncio.create_task(self._perform_activation())
+        try:
+            await asyncio.shield(self._activation_task)
+        except asyncio.CancelledError:
+            # A sent ready has an uncertain outcome: retire this session, never replay.
+            await self.close()
+            raise
+
+    async def _perform_activation(self) -> None:
+        self._activation = asyncio.get_running_loop().create_future()
+        try:
+            if not self._accepting or self._drain_task is not None:
+                raise RuntimeError("not_ready")
+            async with asyncio.timeout(5):
+                self._send({"type": "ready"})
+                await self._activation
+        except TimeoutError as exc:
+            self._fail(RuntimeError("deadline_exceeded"))
+            raise RuntimeError("deadline_exceeded", "Activation timed out") from exc
+        except BaseException:
+            self._fail(RuntimeError("connection_lost"))
+            raise
+        finally:
+            if self._activation.done() and not self._activation.cancelled():
+                self._activation.exception()
 
     def _spawn(self, coroutine: Any) -> asyncio.Task[Any]:
         task = asyncio.create_task(coroutine)
@@ -358,6 +429,8 @@ class RuntimeHost:
         self._accepting = False
         if abort:
             self._transport.abort()
+        if self._activation is not None and not self._activation.done():
+            self._activation.set_exception(error)
         for ident in list(self._pending):
             self._retire(ident, error)
         if self._drained is not None and not self._drained.done():
@@ -396,7 +469,14 @@ class RuntimeHost:
         ident: str = f.get("id", "")
         if kind == "error" and "id" not in f:
             self._fail(RuntimeError(f["code"], f["message"], f.get("details")))
+        elif kind == "ready":
+            if self._activation is None or self._activation.done() or self._drain_task is not None:
+                raise RuntimeError("protocol_error")
+            self._ready = True
+            self._activation.set_result(None)
         elif kind == "invoke":
+            if not self._ready:
+                raise RuntimeError("protocol_error")
             if not self._accepting or len(self._invocations) >= self._max_concurrency:
                 self._send({"type": "error", "id": ident, "code": "overloaded", "message": "Host is busy"})
                 return
@@ -637,6 +717,7 @@ class RuntimeHost:
         if not _integer(timeout_ms, 1, 60000):
             raise RuntimeError("invalid_input")
         if self._drain_task is None:
+            self._accepting = False
             self._drain_task = asyncio.create_task(self._perform_drain(timeout_ms))
         await asyncio.shield(self._drain_task)
 
@@ -690,6 +771,9 @@ class RuntimeHost:
         finally:
             self._transport.abort()
         tasks = list(self._tasks)
+        if self._activation_task is not None and not self._activation_task.done():
+            self._activation_task.cancel()
+            tasks.append(self._activation_task)
         if self._drain_task is not None and not self._drain_task.done():
             self._drain_task.cancel()
             tasks.append(self._drain_task)
