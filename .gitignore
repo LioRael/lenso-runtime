@@ -12,3 +12,6 @@ __pycache__/
 /sdk/python/.venv/
 
 /dist/
+
+# Per-checkout tools and disposable fixtures; never sync credentials.
+/.agents/state/
