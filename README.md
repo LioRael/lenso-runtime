@@ -124,6 +124,16 @@ remain prerequisites for any future remote production mode, not features here.
 bun tools/generate.ts examples/contracts/logs.json examples/generated logs
 ```
 
+The reusable generator is exported from `@lenso/runtime-sdk/generate` as the
+pure `generate(contract, name)` function returning `{typescript, rust}` strings.
+The existing `tools/generate.ts` command remains a compatibility wrapper around
+that implementation. TS applications using the matching `@lenso/runtime/engine`
+can declare `runtimeContractPlugin({source: "src/runtime-contract.ts", bindings:
+{name: "logs"}})` and run their ordinary `lenso generate` once to produce JSON,
+TS and Rust under `.lenso`. Engine owns output safety, input tracking and unchanged
+bytes; a Rust consumer includes the generated `.rs` directly. No cross-repository
+script invocation or generated-file copying is required in that flow.
+
 The SDK supplies framing, correlation, bounded buffering, heartbeat, stream
 credit and cancellation. Generated clients supply method names and input/output
 types; the kernel still validates every service boundary. Host code supplies

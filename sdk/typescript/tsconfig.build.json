@@ -7,6 +7,12 @@
     "outDir": "dist",
     "rootDir": "."
   },
-  "include": ["index.ts", "schema.ts"],
-  "exclude": ["dist"]
+  "include": [
+    "index.ts",
+    "schema.ts",
+    "generate.ts"
+  ],
+  "exclude": [
+    "dist"
+  ]
 }

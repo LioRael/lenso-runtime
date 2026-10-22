@@ -13,10 +13,14 @@
     "./schema": {
       "types": "./dist/schema.d.ts",
       "import": "./dist/schema.js"
+    },
+    "./generate": {
+      "types": "./dist/generate.d.ts",
+      "import": "./dist/generate.js"
     }
   },
   "scripts": {
-    "build": "bun build index.ts schema.ts --outdir dist --target bun --packages external --splitting && tsc -p tsconfig.build.json",
+    "build": "bun build index.ts schema.ts generate.ts --outdir dist --target bun --packages external --splitting && tsc -p tsconfig.build.json",
     "test": "bun run build && bun test ."
   },
   "dependencies": {
