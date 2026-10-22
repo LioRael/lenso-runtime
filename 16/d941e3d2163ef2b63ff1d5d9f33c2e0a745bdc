@@ -1,0 +1,22 @@
+README.md
+  h_9d56aba080c170 127-136
+sdk/typescript/generate.ts
+  h_9d56aba080c170 1-267
+sdk/typescript/package.json
+  h_9d56aba080c170 16-19,23
+sdk/typescript/tsconfig.build.json
+  h_9d56aba080c170 10-17
+tools/generate.ts
+  h_9d56aba080c170 2-3
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "16d941e3d2163ef2b63ff1d5d9f33c2e0a745bdc",
+  "prompts": {},
+  "humans": {
+    "h_9d56aba080c170": {
+      "author": "LioRael <leo@lenso.dev>"
+    }
+  }
+}
