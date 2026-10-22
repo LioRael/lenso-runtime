@@ -183,7 +183,7 @@ can create an outbound-only caller without publishing server capabilities.
 The Console checkout supplies the independent optional `@lenso/console-runtime`
 page. Its example host selects it only with `LENSO_RUNTIME_PORT`, using the
 existing authenticated administrator session and generic plugin route.
-For source integration, use Bun 1.4.3 in each consuming checkout. In `lenso`,
+For source integration, use Bun 1.4.4 in each consuming checkout. In `lenso`,
 run `bun run prepare:runtime`, then `bun install --frozen-lockfile`, build the
 framework packages and Runtime adapter as directed by `examples/runtime/README.md`,
 and run that example's existing `generate` command. Preparation downloads and
