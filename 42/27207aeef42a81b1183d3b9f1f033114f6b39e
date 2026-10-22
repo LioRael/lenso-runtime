@@ -1,0 +1,24 @@
+.agents/WORKFLOW.md
+  h_9d56aba080c170 3
+.agents/dependencies
+  h_9d56aba080c170 6
+.agents/install-tools
+  h_9d56aba080c170 28-29
+.github/workflows/check.yml
+  h_9d56aba080c170 17
+README.md
+  h_9d56aba080c170 186
+package.json
+  h_9d56aba080c170 4-5
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.7.5",
+  "base_commit_sha": "4227207aeef42a81b1183d3b9f1f033114f6b39e",
+  "prompts": {},
+  "humans": {
+    "h_9d56aba080c170": {
+      "author": "LioRael <leo@lenso.dev>"
+    }
+  }
+}
