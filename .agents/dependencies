@@ -3,7 +3,7 @@ set -eu
 [ "$#" -eq 0 ] || { echo "This script takes no arguments" >&2; exit 64; }
 . .agents/env
 command -v bun >/dev/null 2>&1 || { echo "Required tool: bun; Linux: .agents/setup; macOS: supply the documented tool locally" >&2; exit 78; }
-[ "$(bun --version)" = 1.4.3 ] || { echo "Required bun 1.4.3" >&2; exit 78; }
+[ "$(bun --version)" = 1.4.4 ] || { echo "Required bun 1.4.4" >&2; exit 78; }
 command -v rustc >/dev/null 2>&1 || { echo "Required tool: rustc; Linux: .agents/setup; macOS: supply the documented tool locally" >&2; exit 78; }
 [ "$(rustc --version | cut -d " " -f2)" = 1.94.0 ] || { echo "Required Rust 1.94.0 (runner baseline; CI remains authoritative)" >&2; exit 78; }
 

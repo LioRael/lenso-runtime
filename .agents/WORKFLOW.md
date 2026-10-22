@@ -1,6 +1,6 @@
 # Delta checkout workflow
 
-Tools: bun 1.4.3, rust 1.94.0.
+Tools: bun 1.4.4, rust 1.94.0.
 Rust 1.94.0 is a pinned runner baseline. CI configurations selecting stable
 remain authoritative; setup does not replace the CI gate.
 
