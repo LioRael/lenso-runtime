@@ -566,6 +566,9 @@ fn encoder_counts_newline_and_enqueue_moves_the_once_encoded_buffer() {
     }
     let count = std::cell::Cell::new(0);
     let payload = "x".repeat(MAX_FRAME_BYTES - 3);
+    assert!(frame_fits(&Counted(&count, &payload)));
+    assert_eq!(count.get(), 1);
+    count.set(0);
     let encoded = encode(&Counted(&count, &payload)).unwrap();
     assert_eq!(encoded.0.len(), MAX_FRAME_BYTES);
     assert_eq!(encoded.0.last(), Some(&b'\n'));
@@ -577,6 +580,34 @@ fn encoder_counts_newline_and_enqueue_moves_the_once_encoded_buffer() {
     assert_eq!(received.as_ptr(), allocation);
     assert_eq!(count.get(), 1);
     assert!(encode(&"x".repeat(MAX_FRAME_BYTES - 2)).is_none());
+    assert!(!frame_fits(&"x".repeat(MAX_FRAME_BYTES - 2)));
+}
+
+#[test]
+fn frame_budget_matches_encoded_utf8_escaping_and_newline_boundaries() {
+    for marker in ["é", "\\", "\"", "\n", "\0", "\u{1f7e0}"] {
+        let marker_bytes = serde_json::to_vec(marker).unwrap().len() - 2;
+        let available = MAX_FRAME_BYTES - 3;
+        let mut payload = marker.repeat(available / marker_bytes);
+        payload.push_str(&"x".repeat(available % marker_bytes));
+        assert_eq!(encode(&payload).unwrap().0.len(), MAX_FRAME_BYTES);
+        assert!(frame_fits(&payload), "{marker:?} at the byte limit");
+        payload.push('x');
+        assert!(encode(&payload).is_none());
+        assert!(!frame_fits(&payload), "{marker:?} above the byte limit");
+    }
+}
+
+#[test]
+fn frame_budget_preserves_serialization_failures() {
+    struct Invalid;
+    impl Serialize for Invalid {
+        fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+            Err(serde::ser::Error::custom("invalid test frame"))
+        }
+    }
+    assert!(!frame_fits(&Invalid));
+    assert!(encode(&Invalid).is_none());
 }
 
 #[test]
@@ -592,6 +623,7 @@ fn admission_moves_input_and_invocation_borrows_the_retained_payload() {
     assert_eq!(retained.as_str().unwrap().as_ptr(), allocation);
     let invocation = actor.invocation(2, &actor.calls[&2]).unwrap();
     assert!(std::ptr::eq(invocation.input, retained));
+    assert!(frame_fits(&invocation));
     let serialized = serde_json::from_slice::<Value>(&encode(&invocation).unwrap().0).unwrap();
     assert_eq!(serialized["input"], *retained);
     assert_eq!(serialized["parent_id"], "parent");

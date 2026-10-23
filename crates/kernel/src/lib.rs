@@ -99,6 +99,34 @@ struct Invocation<'a> {
 
 struct EncodedFrame(Vec<u8>);
 
+struct FrameBudget {
+    remaining: usize,
+}
+
+impl io::Write for FrameBudget {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        if bytes.len() > self.remaining {
+            return Err(io::Error::other("frame exceeds byte limit"));
+        }
+        self.remaining -= bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn frame_fits(frame: &impl Serialize) -> bool {
+    serde_json::to_writer(
+        FrameBudget {
+            remaining: MAX_FRAME_BYTES - 1,
+        },
+        frame,
+    )
+    .is_ok()
+}
+
 fn encode(frame: &impl Serialize) -> Option<EncodedFrame> {
     let mut bytes = serde_json::to_vec(frame).ok()?;
     bytes.push(b'\n');
@@ -825,11 +853,10 @@ impl Actor {
             credits: 0,
         };
         // Admission must reject envelope overflow even while capacity is busy.
-        // Dispatch re-encodes borrowed input with the then-current remaining deadline.
+        // Count without retaining bytes; dispatch encodes the current remaining deadline.
         let fits = self
             .invocation(route, &call)
-            .and_then(|invoke| encode(&invoke))
-            .is_some();
+            .is_some_and(|invoke| frame_fits(&invoke));
         if !fits {
             self.error(host, Some(&call.client_id), "invalid_input");
             return;
@@ -904,7 +931,7 @@ impl Actor {
         if infrastructure_error {
             // Preserve overflow rejection of the original expanded envelope, even
             // though infrastructure diagnostics are removed before transmission.
-            if encode(&frame).is_none() {
+            if !frame_fits(&frame) {
                 self.fail(route, "invalid_output");
                 return;
             }

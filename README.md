@@ -444,8 +444,12 @@ transactions, TLS, remote listening or production service/user credentials.
 No Wasm kernel. Pure TS Cloudflare Workers remain independent; connecting a
 Worker to an external native runtime would add network and deployment costs.
 
-The kernel is designed as an independent executable, but signed/precompiled
-platform artifacts, an automatic binary installer, npm/crates publication and
-platform certification are **not completed**. TS-only consumers should eventually
-use matching precompiled binaries without Cargo; this source delivery still
-requires Cargo to create them. No deployment or online resources are changed.
+Precompiled v0.1.0 kernels and installation through the matching CLI are documented
+under [Precompiled use](#precompiled-use) and in the
+[distribution guide](docs/distribution.md). Later changes in this checkout are not
+automatically included in those releases. Building Rust components from source
+still requires Cargo; TS/Go/Python consumers of matching precompiled kernels do not.
+
+The native release workflows do not configure trusted macOS or Windows signing;
+checksums are not publisher signatures. npm/crates publication and platform
+certification must not be inferred from a precompiled release or a local build.
